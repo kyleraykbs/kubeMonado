@@ -1323,7 +1323,7 @@ OfflineSensorCalibration::pushImuSample(t_constellation_device_id_t device_id, c
 }
 
 bool
-OfflineSensorCalibration::optimize(CalibrationResult &out_result, t_constellation_device_id_t requested_device)
+OfflineSensorCalibration::optimize(CalibrationResult &out_result)
 {
 	/*
 	 * Everything the solve reads is taken out of the object here and the lock is dropped before any of the work
@@ -1349,9 +1349,7 @@ OfflineSensorCalibration::optimize(CalibrationResult &out_result, t_constellatio
 			return false;
 		}
 
-		if (requested_device != XRT_CONSTELLATION_INVALID_DEVICE_ID) {
-			device_to_optimize_for = requested_device;
-		} else if (!this->bestDeviceLocked(device_to_optimize_for)) {
+		if (!this->bestDeviceLocked(device_to_optimize_for)) {
 			return false;
 		}
 
@@ -1538,22 +1536,6 @@ OfflineSensorCalibration::optimize(CalibrationResult &out_result, t_constellatio
 	out_result = result;
 
 	return true;
-}
-
-void
-OfflineSensorCalibration::updateCameraPoses(const CalibrationResult &result)
-{
-	std::unique_lock<os::Mutex> lock(this->lock);
-
-	for (const CameraCalibration &solved : result.cameras) {
-		for (CameraDescription &camera : this->cameras) {
-			if (camera.mosaic_idx == solved.mosaic_idx && camera.camera_idx == solved.camera_idx) {
-				camera.Tcv_world_cam = solved.Tcv_world_cam;
-				camera.has_concrete_pose = true;
-				break;
-			}
-		}
-	}
 }
 
 bool

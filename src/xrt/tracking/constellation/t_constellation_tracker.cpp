@@ -152,46 +152,14 @@ run_room_calibration_func(void *ptr)
 
 	// The IMU half of the same solve. Without this the fusion seeds every bias at zero and anchors it there,
 	// so it spends every solve rediscovering intrinsics that were just measured over the whole capture.
-	auto apply_imu_calibration = [tracker](t_constellation_device_id_t device_id,
-	                                       const offline_sensor_calibration::ImuCalibration &imu) {
-		sensor_fusion::DeviceImuCalibration calibration = {
-		    .accel_bias = imu.accel_bias,
-		    .gyro_bias = imu.gyro_bias,
-		    .accel_scale = imu.accel_scale,
-		    .Qcv_imu_model = imu.Qcv_imu_model,
-		};
-		tracker->sensor_fusion->setDeviceImuCalibration(device_id, calibration);
-		tracker->pending_imu_calibrations[device_id] = calibration;
-	};
-
-	apply_imu_calibration(result.device_id, result.imu);
-
-	// The cameras are now known, so solve the IMU model for every other device (e.g. the Touch controllers)
-	// against them. Without this they keep the identity IMU model, which the fusion cannot reconcile with the
-	// camera observations and which makes their tracking far worse than the headset's.
-	calib->updateCameraPoses(result);
-
-	std::vector<t_constellation_device_id_t> device_ids;
-	{
-		std::shared_lock devices_lock(tracker->device_lock);
-		for (auto &device : tracker->devices) {
-			device_ids.push_back(device->id);
-		}
-	}
-
-	for (t_constellation_device_id_t device_id : device_ids) {
-		if (device_id == result.device_id) {
-			continue;
-		}
-
-		offline_sensor_calibration::CalibrationResult device_result;
-		if (!calib->optimize(device_result, device_id)) {
-			CT_WARN(tracker, "No usable IMU calibration for device %d, keeping the default", device_id);
-			continue;
-		}
-
-		CT_INFO(tracker, "Solved IMU calibration for device %d", device_id);
-		apply_imu_calibration(device_id, device_result.imu);
+	if (tracker) {
+		tracker->sensor_fusion->setDeviceImuCalibration(result.device_id,
+		                                                sensor_fusion::DeviceImuCalibration{
+		                                                    .accel_bias = result.imu.accel_bias,
+		                                                    .gyro_bias = result.imu.gyro_bias,
+		                                                    .accel_scale = result.imu.accel_scale,
+		                                                    .Qcv_imu_model = result.imu.Qcv_imu_model,
+		                                                });
 	}
 
 	{
@@ -199,7 +167,7 @@ run_room_calibration_func(void *ptr)
 		tracker->running_calibration = false;
 	}
 
-	tracker->saveRoomSetupCurrent();
+	tracker->saveRoomSetup(result);
 
 	{
 		std::shared_lock devices_lock(tracker->device_lock);
@@ -1530,10 +1498,11 @@ ConstellationTracker::checkSensorCalibration()
 	if (!calib->isCollectingData()) {
 		calib->beginCollectingData();
 
-		// Enable every device so each one collects the camera observations and IMU samples it needs for its
-		// own IMU calibration solve, not just the headset.
+		// Enable the first device, disable all others, for the purposes of clean data.
+		bool is_first = true;
 		for (auto &device : this->devices) {
-			device->enabled.store(true);
+			device->enabled.store(is_first);
+			is_first = false;
 		}
 	}
 

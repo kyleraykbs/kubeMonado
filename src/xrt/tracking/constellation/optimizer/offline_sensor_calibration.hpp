@@ -217,22 +217,9 @@ public: // Methods
 	void
 	pushImuSample(t_constellation_device_id_t device_id, const xrt_imu_sample &sample);
 
-	/*!
-	 * Runs the optimizer on the data that has been passed.
-	 *
-	 * @param out_result Written only when this returns true.
-	 * @param device_id  The device to solve. Pass XRT_CONSTELLATION_INVALID_DEVICE_ID to use the best device.
-	 */
+	//! Runs the optimizer on the data that has been passed
 	bool
-	optimize(CalibrationResult &out_result,
-	         t_constellation_device_id_t device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID);
-
-	/*!
-	 * Copies the solved camera poses from @p result back into the calibration job and marks them concrete, so a
-	 * later @ref optimize call for another device holds the cameras fixed instead of re-solving them.
-	 */
-	void
-	updateCameraPoses(const CalibrationResult &result);
+	optimize(CalibrationResult &out_result);
 
 	bool
 	numSamplesForBestDevice(size_t &out_num_samples) const;
