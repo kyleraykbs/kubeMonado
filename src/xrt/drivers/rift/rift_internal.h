@@ -1088,6 +1088,10 @@ rift_touch_calibration_parse(const char *calibration_data,
                              size_t calibration_size,
                              struct rift_touch_controller_calibration *out_calibration);
 
+int
+rift_add_touch_controller_to_constellation_tracker(struct rift_hmd *hmd,
+                                                   struct rift_touch_controller *controller);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

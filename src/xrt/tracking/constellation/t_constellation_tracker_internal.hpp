@@ -35,6 +35,8 @@
 #include <stdexcept>
 #include <array>
 #include <fstream>
+#include <string>
+#include <map>
 
 #include "correspondence_search.h"
 #include "led_search_model.h"
@@ -466,6 +468,9 @@ public: // Fields
 
 	std::unique_ptr<sensor_fusion::SensorFusion> sensor_fusion{};
 
+	std::string room_setup_file;
+	std::map<t_constellation_device_id_t, sensor_fusion::DeviceImuCalibration> pending_imu_calibrations;
+
 #ifdef XRT_FEATURE_RERUN
 	std::unique_ptr<struct RerunContext> rerun_stream{};
 #endif
@@ -512,6 +517,12 @@ public: // Methods
 
 	void
 	getTrackedPose(t_constellation_device_id_t device_id, timepoint_ns when_ns, xrt_space_relation &out_relation);
+
+	bool
+	loadRoomSetup();
+
+	void
+	saveRoomSetup(const offline_sensor_calibration::CalibrationResult &result);
 };
 
 }; // namespace xrt::tracking::constellation

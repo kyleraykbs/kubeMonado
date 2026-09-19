@@ -20,6 +20,8 @@
 #include "t_constellation_tracker_internal.hpp"
 #include "t_constellation_tracker_dataset.hpp"
 
+#include "util/u_file.h"
+
 #ifdef XRT_FEATURE_RERUN
 #include "constellation_tracker_rerun.hpp"
 #endif
@@ -35,6 +37,7 @@ namespace xrt::tracking::constellation {
 
 DEBUG_GET_ONCE_LOG_OPTION(constellation_tracker_log, "CONSTELLATION_TRACKER_LOG", U_LOGGING_WARN)
 DEBUG_GET_ONCE_OPTION(constellation_tracker_data_recorder_output, "CONSTELLATION_TRACKER_DATA_RECORDER_OUTPUT", "")
+DEBUG_GET_ONCE_OPTION(constellation_tracker_room_setup_file, "CONSTELLATION_TRACKER_ROOM_SETUP_FILE", "")
 
 // Unconditionally present to allow warning that the feature is not enabled.
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_enable_rerun, "CONSTELLATION_TRACKER_RERUN_ENABLE", false)
@@ -162,6 +165,8 @@ run_room_calibration_func(void *ptr)
 		std::unique_lock<os::Mutex> lock(tracker->offline_sensor_calibration_lock);
 		tracker->running_calibration = false;
 	}
+
+	tracker->saveRoomSetup(result);
 
 	{
 		std::shared_lock devices_lock(tracker->device_lock);
@@ -1312,7 +1317,116 @@ ConstellationTracker::ConstellationTracker(t_constellation_tracker_params *param
 		}
 	}
 
+	this->room_setup_file = debug_get_option_constellation_tracker_room_setup_file();
+	if (this->room_setup_file.empty()) {
+		char buf[1024];
+		if (u_file_get_path_in_config_dir("rift_room_setup.txt", buf, sizeof(buf)) == 0) {
+			this->room_setup_file = buf;
+		}
+	}
+	if (!this->room_setup_file.empty()) {
+		this->loadRoomSetup();
+	}
+
 	CT_DEBUG(this, "Created constellation tracker with %zu mosaics", this->mosaics.size());
+}
+
+bool
+ConstellationTracker::loadRoomSetup()
+{
+	if (this->room_setup_file.empty()) {
+		return false;
+	}
+
+	std::ifstream file(this->room_setup_file);
+	if (!file.is_open()) {
+		return false;
+	}
+
+	std::string line;
+	int cameras_loaded = 0;
+	int imus_loaded = 0;
+	while (std::getline(file, line)) {
+		if (line.empty() || line[0] == '#') {
+			continue;
+		}
+		if (line.rfind("camera ", 0) == 0) {
+			size_t mosaic_idx, camera_idx;
+			xrt_pose pose = XRT_POSE_IDENTITY;
+			if (sscanf(line.c_str(), "camera %zu %zu %f %f %f %f %f %f %f", &mosaic_idx, &camera_idx,
+			           &pose.position.x, &pose.position.y, &pose.position.z, &pose.orientation.x,
+			           &pose.orientation.y, &pose.orientation.z, &pose.orientation.w) == 8) {
+				if (mosaic_idx < this->mosaics.size() && camera_idx < this->mosaics[mosaic_idx]->cameras.size()) {
+					auto &camera = this->mosaics[mosaic_idx]->cameras[camera_idx];
+					camera->locked_data.Txr_origin_cam = pose;
+					camera->locked_data.has_concrete_pose = true;
+					cameras_loaded++;
+				}
+			}
+		} else if (line.rfind("imu ", 0) == 0) {
+			int device_id;
+			sensor_fusion::DeviceImuCalibration calib{};
+			if (sscanf(line.c_str(), "imu %d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf",
+			           &device_id, &calib.accel_bias.x, &calib.accel_bias.y, &calib.accel_bias.z,
+			           &calib.gyro_bias.x, &calib.gyro_bias.y, &calib.gyro_bias.z, &calib.accel_scale.x,
+			           &calib.accel_scale.y, &calib.accel_scale.z, &calib.Qcv_imu_model.x,
+			           &calib.Qcv_imu_model.y, &calib.Qcv_imu_model.z, &calib.Qcv_imu_model.w) == 14) {
+				this->pending_imu_calibrations[(t_constellation_device_id_t)device_id] = calib;
+				imus_loaded++;
+			}
+		}
+	}
+
+	if (cameras_loaded > 0) {
+		CT_INFO(this, "Loaded room setup from %s: %d cameras, %d IMU calibrations", this->room_setup_file.c_str(),
+		        cameras_loaded, imus_loaded);
+	}
+	return cameras_loaded > 0;
+}
+
+void
+ConstellationTracker::saveRoomSetup(const offline_sensor_calibration::CalibrationResult &result)
+{
+	if (this->room_setup_file.empty()) {
+		return;
+	}
+
+	std::string tmp_file = this->room_setup_file + ".tmp";
+	std::ofstream out(tmp_file);
+	if (!out.is_open()) {
+		CT_WARN(this, "Failed to open room setup file for writing: %s", tmp_file.c_str());
+		return;
+	}
+
+	out << "# monado constellation room setup v2\n";
+
+	for (auto &mosaic : this->mosaics) {
+		for (auto &camera : mosaic->cameras) {
+			if (camera->locked_data.has_concrete_pose) {
+				auto &pose = camera->locked_data.Txr_origin_cam;
+				out << "camera " << mosaic->index << " " << camera->index << " " << pose.position.x << " "
+				    << pose.position.y << " " << pose.position.z << " " << pose.orientation.x << " "
+				    << pose.orientation.y << " " << pose.orientation.z << " " << pose.orientation.w << "\n";
+			}
+		}
+	}
+
+	out << "imu " << result.device_id << " " << result.imu.accel_bias.x << " " << result.imu.accel_bias.y << " "
+	    << result.imu.accel_bias.z << " " << result.imu.gyro_bias.x << " " << result.imu.gyro_bias.y << " "
+	    << result.imu.gyro_bias.z << " " << result.imu.accel_scale.x << " " << result.imu.accel_scale.y << " "
+	    << result.imu.accel_scale.z << " " << result.imu.Qcv_imu_model.x << " " << result.imu.Qcv_imu_model.y << " "
+	    << result.imu.Qcv_imu_model.z << " " << result.imu.Qcv_imu_model.w << "\n";
+
+	if (!out.good()) {
+		CT_WARN(this, "Failed to write room setup file: %s", tmp_file.c_str());
+		return;
+	}
+	out.close();
+
+	if (rename(tmp_file.c_str(), this->room_setup_file.c_str()) != 0) {
+		CT_WARN(this, "Failed to rename room setup file from %s to %s", tmp_file.c_str(),
+		        this->room_setup_file.c_str());
+	}
 }
 
 ConstellationTracker::~ConstellationTracker()
@@ -1460,6 +1574,12 @@ ConstellationTracker::addDevice(t_constellation_tracker_device_params *params, t
 	}
 
 	this->sensor_fusion->addDevice(id, new_device->search_model->led_model);
+
+	auto it = this->pending_imu_calibrations.find(id);
+	if (it != this->pending_imu_calibrations.end()) {
+		this->sensor_fusion->setDeviceImuCalibration(id, it->second);
+		CT_INFO(this, "Applied saved IMU calibration for device %d", id);
+	}
 
 	return id;
 }
