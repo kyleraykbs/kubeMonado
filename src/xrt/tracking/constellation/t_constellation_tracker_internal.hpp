@@ -474,7 +474,7 @@ public: // Fields
 
 	CalibrationServer *calibration_server{nullptr};
 
-	uint32_t calibration_expected_per_camera{1500};
+	uint32_t calibration_expected_per_camera{300};
 
 	xrt_pose recenter_offset = XRT_POSE_IDENTITY;
 	bool has_recenter{false};

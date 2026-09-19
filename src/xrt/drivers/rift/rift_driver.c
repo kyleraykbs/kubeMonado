@@ -160,8 +160,13 @@ rift_sensor_thread_tick(struct rift_hmd *hmd)
 			// round to nearest half mm
 			iad_mm = roundf(iad_mm * 2.0f) / 2.0f;
 
-			// convert to meters
-			hmd->default_icd = iad_mm / 1000.0f;
+			float new_icd = iad_mm / 1000.0f;
+			// Only apply large enough physical slider moves to avoid jitter from ADC noise.
+			// Threshold ~1mm (0.001m) filters small/noisy movements; larger moves update digital IPD.
+			if (fabsf(new_icd - hmd->default_icd) > 0.001f) {
+				hmd->default_icd = new_icd;
+				HMD_INFO(hmd, "IPD slider moved: %.1f mm (ICD %.4f m)", (double)iad_mm, (double)new_icd);
+			}
 		}
 
 		// if there's no samples, just do nothing.
