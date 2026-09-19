@@ -535,6 +535,10 @@ public: // Methods
 	void
 	saveRoomSetupCurrent();
 
+	//! Creates a fresh offline calibration job and registers every camera with it.
+	void
+	setupOfflineSensorCalibration();
+
 	bool
 	recenter(float eye_height);
 

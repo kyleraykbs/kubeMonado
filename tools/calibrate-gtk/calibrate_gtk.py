@@ -114,7 +114,7 @@ class CalibrationWindow(Gtk.ApplicationWindow):
         settings = Gtk.Grid(column_spacing=24, row_spacing=6)
         box.append(settings)
 
-        settings.attach(Gtk.Label(label="Samples required", xalign=0), 0, 0, 1, 1)
+        settings.attach(Gtk.Label(label="Samples per camera", xalign=0), 0, 0, 1, 1)
         self.expected_spin = Gtk.SpinButton.new_with_range(10, 5000, 10)
         self.expected_spin.set_value(100)
         self.expected_spin.connect(
@@ -431,10 +431,16 @@ class CalibrationWindow(Gtk.ApplicationWindow):
         context.set_source_rgb(0.12, 0.12, 0.14)
         context.paint()
 
-        points = [(c.position[0], c.position[2]) for c in self.cameras]
+        # Only calibrated cameras have a meaningful pose; uncalibrated ones sit at the origin and would
+        # otherwise all be drawn on top of each other.
+        calibrated = [c for c in self.cameras if c.concrete]
+        points = [(c.position[0], c.position[2]) for c in calibrated]
         points += [(d.position[0], d.position[2]) for d in self.devices if d.valid]
 
         if not points:
+            context.set_source_rgb(0.6, 0.6, 0.65)
+            context.move_to(width / 2.0 - 120, height / 2.0)
+            context.show_text("No calibrated cameras yet - run a calibration")
             return
 
         min_x = min(p[0] for p in points)
@@ -476,7 +482,7 @@ class CalibrationWindow(Gtk.ApplicationWindow):
             context.stroke()
 
         # Cameras as blue dots, devices as green dots.
-        for camera in self.cameras:
+        for camera in calibrated:
             x, y = to_screen(camera.position[0], camera.position[2])
             context.set_source_rgb(0.35, 0.66, 1.0)
             context.arc(x, y, 9.0, 0.0, 6.2832)

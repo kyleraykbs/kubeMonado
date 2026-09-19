@@ -224,6 +224,13 @@ public: // Methods
 	bool
 	numSamplesForBestDevice(size_t &out_num_samples) const;
 
+	/*!
+	 * Returns how many camera observations the best device has per camera, in the order cameras were added.
+	 * The callee is ready to solve once every entry has reached the per-camera target.
+	 */
+	bool
+	numSamplesPerCameraForBestDevice(std::vector<size_t> &out_num_samples) const;
+
 private: // Methods
 	//! Must be called with `lock` already held.
 	bool

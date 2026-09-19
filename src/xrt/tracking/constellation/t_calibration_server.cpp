@@ -42,11 +42,19 @@ static std::string buildStatus(ConstellationTracker *tracker, std::string &out_s
 	size_t expected = 0;
 	size_t num_cameras = 0;
 	for (auto &mosaic : tracker->mosaics) num_cameras += mosaic->cameras.size();
-	expected = num_cameras * tracker->calibration_expected_per_camera;
+	// Per-camera target: the solve waits for the slowest camera, so the bar reflects the lagging one.
+	expected = tracker->calibration_expected_per_camera;
 	bool valid = !tracker->needSensorCalibration();
+	std::vector<size_t> per_camera_samples;
 	if (tracker->offline_sensor_calibration) {
 		collecting = tracker->offline_sensor_calibration->isCollectingData();
-		tracker->offline_sensor_calibration->numSamplesForBestDevice(samples);
+		if (tracker->offline_sensor_calibration->numSamplesPerCameraForBestDevice(per_camera_samples) &&
+		    !per_camera_samples.empty()) {
+			samples = per_camera_samples[0];
+			for (size_t c : per_camera_samples) {
+				if (c < samples) samples = c;
+			}
+		}
 	}
 	{
 		std::unique_lock<os::Mutex> lock(tracker->offline_sensor_calibration_lock);
@@ -54,10 +62,35 @@ static std::string buildStatus(ConstellationTracker *tracker, std::string &out_s
 	}
 	bool is_calibrating = collecting || calibrating;
 	if (!valid && is_calibrating) {
-		if (collecting) snprintf(status, sizeof(status), "Collecting samples %zu/%zu, move HMD in view of all cameras", samples, expected);
-		else snprintf(status, sizeof(status), "Running calibration solve...");
+		if (collecting) {
+			// Name the cameras that still need observations so the user knows where to point the HMD.
+			char lagging[128] = "";
+			size_t lag_count = 0;
+			size_t camera_visit = 0;
+			for (auto &mosaic : tracker->mosaics) {
+				for (auto &camera : mosaic->cameras) {
+					size_t c = camera_visit < per_camera_samples.size() ? per_camera_samples[camera_visit] : 0;
+					if (c < expected) {
+						char tmp[32];
+						snprintf(tmp, sizeof(tmp), "%s%zu", lag_count > 0 ? ", " : "", camera->index);
+						strncat(lagging, tmp, sizeof(lagging) - strlen(lagging) - 1);
+						lag_count++;
+					}
+					camera_visit++;
+				}
+			}
+			if (lag_count > 0) {
+				snprintf(status, sizeof(status),
+				         "Move the HMD in front of camera(s) %s  [slowest %zu/%zu samples]", lagging, samples,
+				         expected);
+			} else {
+				snprintf(status, sizeof(status), "Collecting samples %zu/%zu", samples, expected);
+			}
+		} else {
+			snprintf(status, sizeof(status), "Running calibration solve...");
+		}
 	} else if (!valid && !is_calibrating) {
-		snprintf(status, sizeof(status), "Waiting to collect %zu samples", expected);
+		snprintf(status, sizeof(status), "Waiting to collect %zu samples per camera", expected);
 	} else if (valid) {
 		snprintf(status, sizeof(status), "Tracking (%zu cameras calibrated)", num_cameras);
 	}
@@ -72,13 +105,16 @@ static std::string buildStatus(ConstellationTracker *tracker, std::string &out_s
 	         "STATE calibrating=%d pass=0 progress=%d samples=%zu expected=%zu spread=0.000 inliers=%zu total=%zu gravity=0 agreement_mm=0.0 agreement_deg=0.0 use_all=1 refine=0 valid=%d auto=1 cameras=%zu filter=0.50 tracking_mode=0 mode=0 min_seconds=5 expected_samples=%zu collecting=%d calibrating_flag=%d\n",
 	         is_calibrating ? 1 : 0, progress, samples, expected, samples, samples, valid ? 1 : 0, num_cameras, expected, collecting ? 1 : 0, calibrating ? 1 : 0);
 	out += state;
+	size_t camera_visit = 0;
 	for (auto &mosaic : tracker->mosaics) {
 		for (auto &camera : mosaic->cameras) {
 			auto &pose = camera->locked_data.Txr_origin_cam;
 			bool concrete = camera->locked_data.has_concrete_pose;
+			size_t camera_samples = camera_visit < per_camera_samples.size() ? per_camera_samples[camera_visit] : 0;
 			char line[256];
-			snprintf(line, sizeof(line), "CAM %zu %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f 0 0\n", camera->index, concrete ? 1 : 0, pose.position.x, pose.position.y, pose.position.z, pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
+			snprintf(line, sizeof(line), "CAM %zu %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f 0 %zu\n", camera->index, concrete ? 1 : 0, pose.position.x, pose.position.y, pose.position.z, pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w, camera_samples);
 			out += line;
+			camera_visit++;
 		}
 	}
 	{
@@ -126,7 +162,7 @@ static void handleCommand(CalibrationServer *server, const char *line) {
 		if (sscanf(rest, "%63s %63s", key, value) == 2) {
 			if (strcmp(key, "expected") == 0 || strcmp(key, "expected_samples") == 0) {
 				int v = atoi(value);
-				if (v > 0) tracker->calibration_expected_per_camera = (uint32_t)(v / tracker->mosaics[0]->cameras.size());
+				if (v > 0) tracker->calibration_expected_per_camera = (uint32_t)v;
 			} else if (strcmp(key, "filter") == 0) {
 			} else if (strcmp(key, "tracking_mode") == 0 || strcmp(key, "use_all_cameras") == 0 || strcmp(key, "mode") == 0) {
 			} else if (strcmp(key, "min_seconds") == 0 || strcmp(key, "refine") == 0) {

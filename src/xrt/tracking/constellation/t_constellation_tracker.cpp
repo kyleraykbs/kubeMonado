@@ -1290,25 +1290,11 @@ ConstellationTracker::ConstellationTracker(t_constellation_tracker_params *param
 #endif
 	}
 
-	this->offline_sensor_calibration = std::make_unique<offline_sensor_calibration::OfflineSensorCalibration>();
 	this->sensor_fusion = std::make_unique<sensor_fusion::SensorFusion>();
+	this->setupOfflineSensorCalibration();
 
 	for (auto &mosaic : this->mosaics) {
 		for (auto &camera : mosaic->cameras) {
-			// The solve works in OpenCV space, and its world is the tracking origin: that is the frame the
-			// solved poses are written back into below in checkSensorCalibration.
-			xrt_pose Tcv_origin_cam;
-			math_pose_convert_from_opencv(&camera->locked_data.Txr_origin_cam, &Tcv_origin_cam);
-
-			// Add the camera to the sensor calibration job
-			this->offline_sensor_calibration->addCamera({
-			    .mosaic_idx = mosaic->index,
-			    .camera_idx = camera->index,
-			    .params = camera->model,
-			    .Tcv_world_cam = Tcv_origin_cam,
-			    .has_concrete_pose = camera->locked_data.has_concrete_pose,
-			});
-
 			// Add the camera to the sensor fusion job
 			this->sensor_fusion->addCamera({
 			    .mosaic_idx = mosaic->index,
@@ -1333,6 +1319,29 @@ ConstellationTracker::ConstellationTracker(t_constellation_tracker_params *param
 	this->calibration_server = calibration_server_create(this, nullptr);
 
 	CT_DEBUG(this, "Created constellation tracker with %zu mosaics", this->mosaics.size());
+}
+
+void
+ConstellationTracker::setupOfflineSensorCalibration()
+{
+	// The solve works in OpenCV space, and its world is the tracking origin: that is the frame the solved poses
+	// are written back into in run_room_calibration_func.
+	this->offline_sensor_calibration = std::make_unique<offline_sensor_calibration::OfflineSensorCalibration>();
+
+	for (auto &mosaic : this->mosaics) {
+		for (auto &camera : mosaic->cameras) {
+			xrt_pose Tcv_origin_cam;
+			math_pose_convert_from_opencv(&camera->locked_data.Txr_origin_cam, &Tcv_origin_cam);
+
+			this->offline_sensor_calibration->addCamera({
+			    .mosaic_idx = mosaic->index,
+			    .camera_idx = camera->index,
+			    .params = camera->model,
+			    .Tcv_world_cam = Tcv_origin_cam,
+			    .has_concrete_pose = camera->locked_data.has_concrete_pose,
+			});
+		}
+	}
 }
 
 bool
@@ -1497,14 +1506,22 @@ ConstellationTracker::checkSensorCalibration()
 		}
 	}
 
-	size_t num_samples;
-	if (!calib->numSamplesForBestDevice(num_samples)) {
+	// Require every camera to have seen the device enough times. Using the total across cameras lets the solve
+	// run while some cameras have barely any observations, which produces garbage camera poses.
+	std::vector<size_t> per_camera_samples;
+	if (!calib->numSamplesPerCameraForBestDevice(per_camera_samples)) {
 		// Nothing yet
 		return true;
 	}
 
-	if (num_samples < (num_cameras * this->calibration_expected_per_camera)) {
+	if (per_camera_samples.size() < num_cameras) {
 		return true;
+	}
+
+	for (size_t camera_samples : per_camera_samples) {
+		if (camera_samples < this->calibration_expected_per_camera) {
+			return true;
+		}
 	}
 
 	// Stop collecting data
@@ -1773,6 +1790,11 @@ ConstellationTracker::recenter(float eye_height)
 void
 ConstellationTracker::resetCalibration()
 {
+	// Join any solve that is in flight before tearing down the job it is working on.
+	if (this->offline_sensor_calibration_thread.initialized) {
+		os_thread_helper_stop_and_wait(&this->offline_sensor_calibration_thread);
+	}
+
 	for (auto &mosaic : this->mosaics) {
 		for (auto &camera : mosaic->cameras) {
 			camera->locked_data.has_concrete_pose = false;
@@ -1785,8 +1807,15 @@ ConstellationTracker::resetCalibration()
 		this->running_calibration = false;
 	}
 
-	this->offline_sensor_calibration = std::make_unique<offline_sensor_calibration::OfflineSensorCalibration>();
+	// Rebuild the calibration job with every camera registered again. Without this the solve has no cameras and
+	// immediately fails, leaving the cameras without concrete poses forever.
+	this->setupOfflineSensorCalibration();
 	this->pending_imu_calibrations.clear();
+
+	if (this->sensor_fusion) {
+		this->sensor_fusion->reset();
+	}
+
 	this->has_recenter = false;
 	this->recenter_offset = XRT_POSE_IDENTITY;
 

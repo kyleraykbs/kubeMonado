@@ -1558,6 +1558,32 @@ OfflineSensorCalibration::numSamplesForBestDevice(size_t &out_num_samples) const
 }
 
 bool
+OfflineSensorCalibration::numSamplesPerCameraForBestDevice(std::vector<size_t> &out_num_samples) const
+{
+	std::unique_lock<os::Mutex> lock(this->lock);
+
+	t_constellation_device_id_t best_device;
+	if (!this->bestDeviceLocked(best_device)) {
+		return false;
+	}
+
+	out_num_samples.assign(this->cameras.size(), 0);
+
+	const DeviceSamples &samples = this->device_samples.find(best_device)->second;
+	for (const DeviceCameraSample &sample : samples.camera_samples) {
+		for (size_t i = 0; i < this->cameras.size(); i++) {
+			if (this->cameras[i].mosaic_idx == sample.mosaic_idx &&
+			    this->cameras[i].camera_idx == sample.camera_idx) {
+				out_num_samples[i]++;
+				break;
+			}
+		}
+	}
+
+	return true;
+}
+
+bool
 OfflineSensorCalibration::bestDeviceLocked(t_constellation_device_id_t &out_device) const
 {
 	if (this->device_samples.size() == 0) {
