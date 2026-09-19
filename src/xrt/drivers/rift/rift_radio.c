@@ -47,29 +47,25 @@ rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
 	case XRT_INPUT_TOUCH_AIM_POSE: {
 		struct xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
 
-		// Use the same IMU-fused constellation pose as the HMD. Reading the raw per-camera history
-		// directly gives a noisy, laggy pose that jumps whenever the set of cameras seeing the ring
-		// changes.
-		if (controller->use_constellation) {
-			if (t_constellation_tracker_get_tracked_pose(controller->constellation_tracker,
-			                                             controller->constellation_device_id,
-			                                             at_timestamp_ns, &relation) < 0) {
-				relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
-			}
-		}
-
-		// Fall back to the last raw constellation pose while the fusion has not produced one yet.
-		if (relation.relation_flags == 0) {
-			m_relation_history_get(controller->constellation_relation_history, at_timestamp_ns, &relation);
-		}
-
-		// Last resort, the IMU's 3DoF orientation.
-		if (relation.relation_flags == 0 &&
-		    imu_fusion_get_prediction(controller->input.imu_fusion, (uint64_t)at_timestamp_ns,
+		if (imu_fusion_get_prediction(controller->input.imu_fusion, (uint64_t)at_timestamp_ns,
 		                              &relation.pose.orientation, &relation.angular_velocity) == 0) {
 			relation.relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
 			                          XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
 			                          XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+
+			if (controller->use_constellation) {
+				// borrow the angular velocity from the IMU, but just use the constellation position
+				// and orientation
+				struct xrt_vec3 ang_vel = relation.angular_velocity;
+				m_relation_history_get(controller->constellation_relation_history, at_timestamp_ns,
+				                       &relation);
+				relation.angular_velocity = ang_vel;
+				relation.relation_flags = XRT_SPACE_RELATION_POSITION_VALID_BIT |
+				                          XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+				                          XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+				                          XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+				                          XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+			}
 		}
 
 		(*out_relation) = relation;
