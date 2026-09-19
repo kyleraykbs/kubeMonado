@@ -1633,10 +1633,157 @@ ConstellationTracker::getTrackedPose(t_constellation_device_id_t device_id,
 		// Predict to the requested time
 		m_predict_relation(&relation, time_ns_to_s(when_ns - pose_ts), &out_relation);
 
+		if (this->has_recenter) {
+			xrt_space_relation recentered = XRT_SPACE_RELATION_ZERO;
+			math_pose_transform(&this->recenter_offset, &out_relation.pose, &recentered.pose);
+			recentered.relation_flags = out_relation.relation_flags;
+			if ((out_relation.relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0) {
+				math_quat_rotate_vec3(&this->recenter_offset.orientation, &out_relation.linear_velocity,
+				                      &recentered.linear_velocity);
+				recentered.relation_flags = static_cast<xrt_space_relation_flags>(
+				    recentered.relation_flags | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
+			}
+			if ((out_relation.relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) != 0) {
+				math_quat_rotate_vec3(&this->recenter_offset.orientation, &out_relation.angular_velocity,
+				                      &recentered.angular_velocity);
+				recentered.relation_flags = static_cast<xrt_space_relation_flags>(
+				    recentered.relation_flags | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+			}
+			out_relation = recentered;
+		}
+
 		return;
 	}
 
 	throw std::runtime_error("Device missing, failed to get tracked pose.");
+}
+
+void
+ConstellationTracker::saveRoomSetupCurrent()
+{
+	if (this->room_setup_file.empty()) {
+		return;
+	}
+
+	std::string tmp_file = this->room_setup_file + ".tmp";
+	std::ofstream out(tmp_file);
+	if (!out.is_open()) {
+		CT_WARN(this, "Failed to open room setup file for writing: %s", tmp_file.c_str());
+		return;
+	}
+
+	out << "# monado constellation room setup v2\n";
+
+	for (auto &mosaic : this->mosaics) {
+		for (auto &camera : mosaic->cameras) {
+			if (camera->locked_data.has_concrete_pose) {
+				auto &pose = camera->locked_data.Txr_origin_cam;
+				out << "camera " << mosaic->index << " " << camera->index << " " << pose.position.x << " "
+				    << pose.position.y << " " << pose.position.z << " " << pose.orientation.x << " "
+				    << pose.orientation.y << " " << pose.orientation.z << " " << pose.orientation.w << "\n";
+			}
+		}
+	}
+
+	for (auto &kv : this->pending_imu_calibrations) {
+		auto &calib = kv.second;
+		out << "imu " << kv.first << " " << calib.accel_bias.x << " " << calib.accel_bias.y << " "
+		    << calib.accel_bias.z << " " << calib.gyro_bias.x << " " << calib.gyro_bias.y << " "
+		    << calib.gyro_bias.z << " " << calib.accel_scale.x << " " << calib.accel_scale.y << " "
+		    << calib.accel_scale.z << " " << calib.Qcv_imu_model.x << " " << calib.Qcv_imu_model.y << " "
+		    << calib.Qcv_imu_model.z << " " << calib.Qcv_imu_model.w << "\n";
+	}
+
+	if (this->has_recenter) {
+		auto &pose = this->recenter_offset;
+		out << "recenter " << pose.position.x << " " << pose.position.y << " " << pose.position.z << " "
+		    << pose.orientation.x << " " << pose.orientation.y << " " << pose.orientation.z << " "
+		    << pose.orientation.w << "\n";
+	}
+
+	if (!out.good()) {
+		CT_WARN(this, "Failed to write room setup file: %s", tmp_file.c_str());
+		return;
+	}
+	out.close();
+
+	if (rename(tmp_file.c_str(), this->room_setup_file.c_str()) != 0) {
+		CT_WARN(this, "Failed to rename room setup file from %s to %s", tmp_file.c_str(),
+		        this->room_setup_file.c_str());
+	}
+}
+
+bool
+ConstellationTracker::recenter(float eye_height)
+{
+	xrt_space_relation hmd_relation = XRT_SPACE_RELATION_ZERO;
+	{
+		std::shared_lock lock(this->device_lock);
+		if (this->devices.empty()) {
+			return false;
+		}
+		t_constellation_device_id_t hmd_id = this->devices[0]->id;
+		timepoint_ns now = os_monotonic_get_ns();
+		try {
+			this->getTrackedPose(hmd_id, now, hmd_relation);
+		} catch (...) {
+			return false;
+		}
+	}
+
+	if ((hmd_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) == 0 ||
+	    (hmd_relation.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) == 0) {
+		return false;
+	}
+
+	xrt_vec3 hmd_pos = hmd_relation.pose.position;
+	xrt_quat hmd_quat = hmd_relation.pose.orientation;
+
+	float yaw = atan2f(2.0f * (hmd_quat.w * hmd_quat.y + hmd_quat.x * hmd_quat.z),
+	                   1.0f - 2.0f * (hmd_quat.y * hmd_quat.y + hmd_quat.z * hmd_quat.z));
+
+	xrt_vec3 yaw_axis = {0, 1, 0};
+	xrt_quat yaw_quat;
+	math_quat_from_angle_vector(-yaw, &yaw_axis, &yaw_quat);
+
+	xrt_pose desired = XRT_POSE_IDENTITY;
+	desired.position = {0, eye_height, 0};
+	desired.orientation = yaw_quat;
+
+	xrt_pose inv_hmd;
+	math_pose_invert(&hmd_relation.pose, &inv_hmd);
+	math_pose_transform(&desired, &inv_hmd, &this->recenter_offset);
+	this->has_recenter = true;
+
+	CT_INFO(this, "Recentered world, eye height %.2f m", eye_height);
+	return true;
+}
+
+void
+ConstellationTracker::resetCalibration()
+{
+	for (auto &mosaic : this->mosaics) {
+		for (auto &camera : mosaic->cameras) {
+			camera->locked_data.has_concrete_pose = false;
+			camera->locked_data.Txr_origin_cam = XRT_POSE_IDENTITY;
+		}
+	}
+
+	{
+		std::unique_lock<os::Mutex> lock(this->offline_sensor_calibration_lock);
+		this->running_calibration = false;
+	}
+
+	this->offline_sensor_calibration = std::make_unique<offline_sensor_calibration::OfflineSensorCalibration>();
+	this->pending_imu_calibrations.clear();
+	this->has_recenter = false;
+	this->recenter_offset = XRT_POSE_IDENTITY;
+
+	if (!this->room_setup_file.empty()) {
+		unlink(this->room_setup_file.c_str());
+	}
+
+	CT_INFO(this, "Calibration reset, will recollect on next sample");
 }
 
 }; // namespace xrt::tracking::constellation

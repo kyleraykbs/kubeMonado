@@ -93,6 +93,7 @@ struct CameraMosaic;
 struct ConstellationTracker;
 struct DataRecorder;
 struct Device;
+struct CalibrationServer;
 
 struct FoundDevicePose
 {
@@ -471,6 +472,13 @@ public: // Fields
 	std::string room_setup_file;
 	std::map<t_constellation_device_id_t, sensor_fusion::DeviceImuCalibration> pending_imu_calibrations;
 
+	CalibrationServer *calibration_server{nullptr};
+
+	uint32_t calibration_expected_per_camera{1500};
+
+	xrt_pose recenter_offset = XRT_POSE_IDENTITY;
+	bool has_recenter{false};
+
 #ifdef XRT_FEATURE_RERUN
 	std::unique_ptr<struct RerunContext> rerun_stream{};
 #endif
@@ -523,6 +531,15 @@ public: // Methods
 
 	void
 	saveRoomSetup(const offline_sensor_calibration::CalibrationResult &result);
+
+	void
+	saveRoomSetupCurrent();
+
+	bool
+	recenter(float eye_height);
+
+	void
+	resetCalibration();
 };
 
 }; // namespace xrt::tracking::constellation

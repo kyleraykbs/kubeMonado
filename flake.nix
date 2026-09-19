@@ -77,9 +77,46 @@
 
             patches = [ ];
           });
+
+          calibrate-gtk = pkgs.python3Packages.buildPythonApplication {
+            pname = "monado-calibrate-gtk";
+            version = "0.1.0";
+            src = ./tools/calibrate-gtk;
+            format = "other";
+
+            nativeBuildInputs = [
+              pkgs.wrapGAppsHook4
+              pkgs.gobject-introspection
+            ];
+
+            buildInputs = [ pkgs.gtk4 ];
+
+            propagatedBuildInputs = [ pkgs.python3Packages.pygobject3 ];
+
+            dontBuild = true;
+
+            installPhase = ''
+              runHook preInstall
+
+              mkdir -p $out/bin $out/share/applications
+              install -m755 calibrate_gtk.py $out/bin/monado-calibrate-gtk
+              install -m644 monado-calibrate-gtk.desktop $out/share/applications/
+
+              runHook postInstall
+            '';
+
+            meta = {
+              description = "GTK room setup and status app for the Monado constellation tracker";
+              license = lib.licenses.boost;
+              mainProgram = "monado-calibrate-gtk";
+            };
+          };
         in
         {
           packages.default = package;
+          packages.monado = package;
+          packages.calibrate-gtk = calibrate-gtk;
+
           devShells.default = package.overrideAttrs (oldAttrs: {
             nativeBuildInputs = oldAttrs.nativeBuildInputs ++ devTools;
           });
