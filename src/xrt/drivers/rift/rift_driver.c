@@ -1550,6 +1550,55 @@ rift_add_to_constellation_tracker(struct rift_hmd *hmd, struct t_constellation_t
 	// Mark that we're using constellation poses now
 	hmd->use_constellation_poses = true;
 
+	// Controllers that connected and read their calibration before the tracker existed.
+	os_mutex_lock(&hmd->device_mutex);
+	for (int i = 0; i < RADIO_STATE_TOUCH_CONTROLLERS_LEN; ++i) {
+		rift_add_touch_controller_to_constellation_tracker(hmd, hmd->radio_state.touch_controllers[i]);
+	}
+	os_mutex_unlock(&hmd->device_mutex);
+
+	return 0;
+}
+
+int
+rift_add_touch_controller_to_constellation_tracker(struct rift_hmd *hmd, struct rift_touch_controller *controller)
+{
+	if (controller == NULL || controller->device_type == RIFT_RADIO_DEVICE_TRACKED_OBJECT) {
+		return 0;
+	}
+
+	if (hmd->constellation_tracker == NULL || !controller->input.calibration_read) {
+		return 0;
+	}
+
+	os_mutex_lock(&controller->constellation_mutex);
+
+	if (controller->use_constellation) {
+		os_mutex_unlock(&controller->constellation_mutex);
+		return 0;
+	}
+
+	struct t_constellation_tracker_device_params controller_params = {
+	    .led_model = controller->input.calibration.led_model,
+	    .tracking_source = &controller->constellation_tracking_source,
+	};
+
+	int ret = t_constellation_tracker_add_device(hmd->constellation_tracker, &controller_params,
+	                                             &controller->constellation_device,
+	                                             &controller->constellation_device_id);
+	if (ret < 0) {
+		HMD_ERROR(hmd, "Failed to add Oculus Touch controller to constellation tracker, reason %d", ret);
+		os_mutex_unlock(&controller->constellation_mutex);
+		return ret;
+	}
+
+	controller->constellation_tracker = hmd->constellation_tracker;
+	controller->constellation_imu_sink = controller_params.imu_sink;
+	controller->base.tracking_origin = hmd->base.tracking_origin;
+	controller->use_constellation = true;
+
+	os_mutex_unlock(&controller->constellation_mutex);
+
 	return 0;
 }
 

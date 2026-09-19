@@ -27,6 +27,7 @@ extern "C" {
 
 
 struct rift_hmd;
+struct rift_touch_controller;
 
 enum rift_variant
 {
@@ -91,6 +92,13 @@ rift_hmd_frame_timestamp_callback(void *user_data,             //
 
 int
 rift_add_to_constellation_tracker(struct rift_hmd *hmd, struct t_constellation_tracker *tracker);
+
+/*!
+ * Adds a single Touch controller to the constellation tracker, if it has finished reading its calibration.
+ * Does nothing when the tracker does not exist yet or the controller was already added.
+ */
+int
+rift_add_touch_controller_to_constellation_tracker(struct rift_hmd *hmd, struct rift_touch_controller *controller);
 
 /*!
  * Gets the HMD's timing event source.
