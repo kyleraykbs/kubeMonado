@@ -105,14 +105,13 @@ static std::string buildStatus(ConstellationTracker *tracker, std::string &out_s
 static void handleCommand(CalibrationServer *server, const char *line) {
 	ConstellationTracker *tracker = server->tracker;
 	if (strcmp(line, "START") == 0) {
-		if (!tracker->needSensorCalibration()) {
-			tracker->resetCalibration();
-		}
+		tracker->resetCalibration();
 	} else if (strcmp(line, "STOP") == 0) {
 		if (tracker->offline_sensor_calibration && tracker->offline_sensor_calibration->isCollectingData()) {
 			tracker->offline_sensor_calibration->endCollectingData();
 		}
 	} else if (strcmp(line, "SAVE") == 0) {
+		CT_INFO(tracker, "SAVE command received, saving room setup to %s", tracker->room_setup_file.c_str());
 		tracker->saveRoomSetupCurrent();
 	} else if (strcmp(line, "RESET") == 0) {
 		tracker->resetCalibration();

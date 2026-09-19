@@ -1321,10 +1321,11 @@ ConstellationTracker::ConstellationTracker(t_constellation_tracker_params *param
 	this->room_setup_file = debug_get_option_constellation_tracker_room_setup_file();
 	if (this->room_setup_file.empty()) {
 		char buf[1024];
-		if (u_file_get_path_in_config_dir("rift_room_setup.txt", buf, sizeof(buf)) == 0) {
+		if (u_file_get_path_in_config_dir("rift_room_setup.txt", buf, sizeof(buf)) > 0) {
 			this->room_setup_file = buf;
 		}
 	}
+	CT_INFO(this, "Room setup file: %s", this->room_setup_file.c_str());
 	if (!this->room_setup_file.empty()) {
 		this->loadRoomSetup();
 	}
@@ -1358,7 +1359,7 @@ ConstellationTracker::loadRoomSetup()
 			xrt_pose pose = XRT_POSE_IDENTITY;
 			if (sscanf(line.c_str(), "camera %zu %zu %f %f %f %f %f %f %f", &mosaic_idx, &camera_idx,
 			           &pose.position.x, &pose.position.y, &pose.position.z, &pose.orientation.x,
-			           &pose.orientation.y, &pose.orientation.z, &pose.orientation.w) == 8) {
+			           &pose.orientation.y, &pose.orientation.z, &pose.orientation.w) == 9) {
 				if (mosaic_idx < this->mosaics.size() && camera_idx < this->mosaics[mosaic_idx]->cameras.size()) {
 					auto &camera = this->mosaics[mosaic_idx]->cameras[camera_idx];
 					camera->locked_data.Txr_origin_cam = pose;
@@ -1391,8 +1392,11 @@ void
 ConstellationTracker::saveRoomSetup(const offline_sensor_calibration::CalibrationResult &result)
 {
 	if (this->room_setup_file.empty()) {
+		CT_WARN(this, "saveRoomSetup: room_setup_file is empty, not saving");
 		return;
 	}
+
+	CT_INFO(this, "Saving room setup to %s", this->room_setup_file.c_str());
 
 	std::string tmp_file = this->room_setup_file + ".tmp";
 	std::ofstream out(tmp_file);
@@ -1414,7 +1418,7 @@ ConstellationTracker::saveRoomSetup(const offline_sensor_calibration::Calibratio
 		}
 	}
 
-	out << "imu " << result.device_id << " " << result.imu.accel_bias.x << " " << result.imu.accel_bias.y << " "
+	out << "imu " << (int)result.device_id << " " << result.imu.accel_bias.x << " " << result.imu.accel_bias.y << " "
 	    << result.imu.accel_bias.z << " " << result.imu.gyro_bias.x << " " << result.imu.gyro_bias.y << " "
 	    << result.imu.gyro_bias.z << " " << result.imu.accel_scale.x << " " << result.imu.accel_scale.y << " "
 	    << result.imu.accel_scale.z << " " << result.imu.Qcv_imu_model.x << " " << result.imu.Qcv_imu_model.y << " "
@@ -1666,8 +1670,11 @@ void
 ConstellationTracker::saveRoomSetupCurrent()
 {
 	if (this->room_setup_file.empty()) {
+		CT_WARN(this, "saveRoomSetupCurrent: room_setup_file is empty, not saving");
 		return;
 	}
+
+	CT_INFO(this, "Saving current room setup to %s", this->room_setup_file.c_str());
 
 	std::string tmp_file = this->room_setup_file + ".tmp";
 	std::ofstream out(tmp_file);
@@ -1691,7 +1698,7 @@ ConstellationTracker::saveRoomSetupCurrent()
 
 	for (auto &kv : this->pending_imu_calibrations) {
 		auto &calib = kv.second;
-		out << "imu " << kv.first << " " << calib.accel_bias.x << " " << calib.accel_bias.y << " "
+		out << "imu " << (int)kv.first << " " << calib.accel_bias.x << " " << calib.accel_bias.y << " "
 		    << calib.accel_bias.z << " " << calib.gyro_bias.x << " " << calib.gyro_bias.y << " "
 		    << calib.gyro_bias.z << " " << calib.accel_scale.x << " " << calib.accel_scale.y << " "
 		    << calib.accel_scale.z << " " << calib.Qcv_imu_model.x << " " << calib.Qcv_imu_model.y << " "
