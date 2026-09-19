@@ -60,6 +60,9 @@
             # If there are any buildInputs that are not in nixpkgs, add them here
             # buildInputs are any packages that are needed at runtime (i.e. dependencies)
 
+            # Needed for the Ceres based constellation sensor fusion and calibration
+            ceres-solver
+
             # Survive has not received a new tagged release in years, so use the
             # version provided by nixpkgs-xr instead
             (inputs.nixpkgs-xr.packages.${system}.libsurvive)
