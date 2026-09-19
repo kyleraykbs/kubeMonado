@@ -19,6 +19,7 @@
 
 #include "t_constellation_tracker_internal.hpp"
 #include "t_constellation_tracker_dataset.hpp"
+#include "t_calibration_server.hpp"
 
 #include "util/u_file.h"
 
@@ -1328,6 +1329,8 @@ ConstellationTracker::ConstellationTracker(t_constellation_tracker_params *param
 		this->loadRoomSetup();
 	}
 
+	this->calibration_server = calibration_server_create(this, nullptr);
+
 	CT_DEBUG(this, "Created constellation tracker with %zu mosaics", this->mosaics.size());
 }
 
@@ -1431,6 +1434,8 @@ ConstellationTracker::saveRoomSetup(const offline_sensor_calibration::Calibratio
 
 ConstellationTracker::~ConstellationTracker()
 {
+	calibration_server_destroy(&this->calibration_server);
+
 	if (this->offline_sensor_calibration_thread.initialized) {
 		os_thread_helper_destroy(&this->offline_sensor_calibration_thread);
 	}
@@ -1494,8 +1499,7 @@ ConstellationTracker::checkSensorCalibration()
 		return true;
 	}
 
-	// 1000 samples per camera ought to be enough
-	if (num_samples < (num_cameras * 1500)) {
+	if (num_samples < (num_cameras * this->calibration_expected_per_camera)) {
 		return true;
 	}
 

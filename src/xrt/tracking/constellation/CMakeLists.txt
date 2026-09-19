@@ -18,6 +18,8 @@ add_library(
 	t_constellation_tracker_internal.hpp
 	t_constellation_tracker.cpp
 	t_constellation_tracker.h
+	t_calibration_server.cpp
+	t_calibration_server.hpp
 	t_led_sync_refinement.h
 	t_rift_blobwatch.c
 	t_rift_blobwatch.h

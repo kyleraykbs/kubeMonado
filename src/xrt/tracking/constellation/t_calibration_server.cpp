@@ -1,0 +1,276 @@
+// Copyright 2026, Kyle
+// SPDX-License-Identifier: BSL-1.0
+#include "t_constellation_tracker_internal.hpp"
+#ifndef _WIN32
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+#ifdef MSG_NOSIGNAL
+#define SEND_FLAGS MSG_NOSIGNAL
+#else
+#define SEND_FLAGS 0
+#endif
+namespace xrt::tracking::constellation {
+#define MAX_CLIENTS 8
+#define LINE_SIZE 512
+struct CalibrationClient { int fd = -1; char line[LINE_SIZE] = {}; size_t len = 0; };
+struct CalibrationServer {
+	ConstellationTracker *tracker = nullptr;
+	int listen_fd = -1;
+	std::string socket_path;
+	std::vector<CalibrationClient> clients;
+	std::thread thread;
+	std::atomic<bool> running{false};
+};
+static std::string buildStatus(ConstellationTracker *tracker, std::string &out_status) {
+	std::string out;
+	char status[256] = "Idle";
+	bool collecting = false;
+	bool calibrating = false;
+	size_t samples = 0;
+	size_t expected = 0;
+	size_t num_cameras = 0;
+	for (auto &mosaic : tracker->mosaics) num_cameras += mosaic->cameras.size();
+	expected = num_cameras * tracker->calibration_expected_per_camera;
+	bool valid = !tracker->needSensorCalibration();
+	if (tracker->offline_sensor_calibration) {
+		collecting = tracker->offline_sensor_calibration->isCollectingData();
+		tracker->offline_sensor_calibration->numSamplesForBestDevice(samples);
+	}
+	{
+		std::unique_lock<os::Mutex> lock(tracker->offline_sensor_calibration_lock);
+		calibrating = tracker->running_calibration;
+	}
+	bool is_calibrating = collecting || calibrating;
+	if (!valid && is_calibrating) {
+		if (collecting) snprintf(status, sizeof(status), "Collecting samples %zu/%zu, move HMD in view of all cameras", samples, expected);
+		else snprintf(status, sizeof(status), "Running calibration solve...");
+	} else if (!valid && !is_calibrating) {
+		snprintf(status, sizeof(status), "Waiting to collect %zu samples", expected);
+	} else if (valid) {
+		snprintf(status, sizeof(status), "Tracking (%zu cameras calibrated)", num_cameras);
+	}
+	int progress = expected > 0 ? (int)(samples * 100 / expected) : 0;
+	if (progress > 100) progress = 100;
+	out_status = status;
+	out += "STATUS ";
+	out += status;
+	out += "\n";
+	char state[512];
+	snprintf(state, sizeof(state),
+	         "STATE calibrating=%d pass=0 progress=%d samples=%zu expected=%zu spread=0.000 inliers=%zu total=%zu gravity=0 agreement_mm=0.0 agreement_deg=0.0 use_all=1 refine=0 valid=%d auto=1 cameras=%zu filter=0.50 tracking_mode=0 mode=0 min_seconds=5 expected_samples=%zu collecting=%d calibrating_flag=%d\n",
+	         is_calibrating ? 1 : 0, progress, samples, expected, samples, samples, valid ? 1 : 0, num_cameras, expected, collecting ? 1 : 0, calibrating ? 1 : 0);
+	out += state;
+	for (auto &mosaic : tracker->mosaics) {
+		for (auto &camera : mosaic->cameras) {
+			auto &pose = camera->locked_data.Txr_origin_cam;
+			bool concrete = camera->locked_data.has_concrete_pose;
+			char line[256];
+			snprintf(line, sizeof(line), "CAM %zu %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f 0 0\n", camera->index, concrete ? 1 : 0, pose.position.x, pose.position.y, pose.position.z, pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
+			out += line;
+		}
+	}
+	{
+		std::shared_lock lock(tracker->device_lock);
+		for (auto &device : tracker->devices) {
+			xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
+			bool has_pose = false;
+			try {
+				tracker->getTrackedPose(device->id, os_monotonic_get_ns(), relation);
+				has_pose = (relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0;
+			} catch (...) { has_pose = false; }
+			char line[256];
+			if (has_pose) {
+				snprintf(line, sizeof(line), "DEV %d 1 %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n", device->id, relation.pose.position.x, relation.pose.position.y, relation.pose.position.z, relation.pose.orientation.x, relation.pose.orientation.y, relation.pose.orientation.z, relation.pose.orientation.w);
+			} else {
+				snprintf(line, sizeof(line), "DEV %d 0 0 0 0 0 0 0 1\n", device->id);
+			}
+			out += line;
+		}
+	}
+	out += "END\n";
+	return out;
+}
+static void handleCommand(CalibrationServer *server, const char *line) {
+	ConstellationTracker *tracker = server->tracker;
+	if (strcmp(line, "START") == 0) {
+		if (!tracker->needSensorCalibration()) {
+			tracker->resetCalibration();
+		}
+	} else if (strcmp(line, "STOP") == 0) {
+		if (tracker->offline_sensor_calibration && tracker->offline_sensor_calibration->isCollectingData()) {
+			tracker->offline_sensor_calibration->endCollectingData();
+		}
+	} else if (strcmp(line, "SAVE") == 0) {
+		tracker->saveRoomSetupCurrent();
+	} else if (strcmp(line, "RESET") == 0) {
+		tracker->resetCalibration();
+	} else if (strncmp(line, "RECENTER", 8) == 0) {
+		float eye_height = 1.6f;
+		if (sscanf(line + 8, "%f", &eye_height) == 1) {}
+		tracker->recenter(eye_height);
+		tracker->saveRoomSetupCurrent();
+	} else if (strncmp(line, "SET ", 4) == 0) {
+		const char *rest = line + 4;
+		char key[64] = {}; char value[64] = {};
+		if (sscanf(rest, "%63s %63s", key, value) == 2) {
+			if (strcmp(key, "expected") == 0 || strcmp(key, "expected_samples") == 0) {
+				int v = atoi(value);
+				if (v > 0) tracker->calibration_expected_per_camera = (uint32_t)(v / tracker->mosaics[0]->cameras.size());
+			} else if (strcmp(key, "filter") == 0) {
+			} else if (strcmp(key, "tracking_mode") == 0 || strcmp(key, "use_all_cameras") == 0 || strcmp(key, "mode") == 0) {
+			} else if (strcmp(key, "min_seconds") == 0 || strcmp(key, "refine") == 0) {
+			}
+		}
+	} else if (strncmp(line, "SET_CAMERA", 10) == 0) {
+		size_t idx; xrt_pose pose; int concrete;
+		if (sscanf(line + 10, "%zu %f %f %f %f %f %f %f %d", &idx, &pose.position.x, &pose.position.y, &pose.position.z, &pose.orientation.x, &pose.orientation.y, &pose.orientation.z, &pose.orientation.w, &concrete) == 8) {
+			for (auto &mosaic : tracker->mosaics) {
+				for (auto &camera : mosaic->cameras) {
+					if (camera->index == idx) {
+						camera->locked_data.Txr_origin_cam = pose;
+						camera->locked_data.has_concrete_pose = concrete != 0;
+					}
+				}
+			}
+		}
+	}
+}
+static void serverThreadFunc(CalibrationServer *server) {
+	while (server->running.load()) {
+		std::vector<struct pollfd> pfds;
+		pfds.reserve(1 + server->clients.size());
+		struct pollfd listen_pfd = {};
+		listen_pfd.fd = server->listen_fd;
+		listen_pfd.events = POLLIN;
+		pfds.push_back(listen_pfd);
+		for (auto &c : server->clients) {
+			if (c.fd >= 0) {
+				struct pollfd pfd = {};
+				pfd.fd = c.fd;
+				pfd.events = POLLIN;
+				pfds.push_back(pfd);
+			}
+		}
+		int ret = poll(pfds.data(), pfds.size(), 200);
+		if (ret < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+		if (pfds[0].revents & POLLIN) {
+			int fd = accept(server->listen_fd, nullptr, nullptr);
+			if (fd >= 0) {
+				int flags = fcntl(fd, F_GETFL, 0);
+				fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+				bool added = false;
+				for (auto &c : server->clients) {
+					if (c.fd < 0) { c.fd = fd; c.len = 0; added = true; break; }
+				}
+				if (!added && server->clients.size() < MAX_CLIENTS) {
+					CalibrationClient client;
+					client.fd = fd;
+					server->clients.push_back(client);
+					added = true;
+				}
+				if (!added) close(fd);
+				else {
+					std::string status;
+					std::string block = buildStatus(server->tracker, status);
+					send(fd, block.c_str(), block.size(), SEND_FLAGS);
+				}
+			}
+		}
+		for (size_t i = 0; i < server->clients.size(); i++) {
+			auto &c = server->clients[i];
+			if (c.fd < 0) continue;
+			size_t pfd_idx = 1 + i;
+			bool has_data = pfd_idx < pfds.size() && (pfds[pfd_idx].revents & POLLIN);
+			bool hup = pfd_idx < pfds.size() && (pfds[pfd_idx].revents & (POLLHUP | POLLERR));
+			if (hup && !has_data) { close(c.fd); c.fd = -1; continue; }
+			if (!has_data) continue;
+			char buf[LINE_SIZE];
+			ssize_t n = recv(c.fd, buf, sizeof(buf) - 1, 0);
+			if (n <= 0) { close(c.fd); c.fd = -1; continue; }
+			for (ssize_t k = 0; k < n; k++) {
+				char ch = buf[k];
+				if (ch == '\n' || ch == '\r') {
+					if (c.len > 0) {
+						c.line[c.len] = '\0';
+						handleCommand(server, c.line);
+						c.len = 0;
+						std::string status;
+						std::string block = buildStatus(server->tracker, status);
+						for (auto &other : server->clients) {
+							if (other.fd >= 0) send(other.fd, block.c_str(), block.size(), SEND_FLAGS);
+						}
+					}
+				} else if (c.len < LINE_SIZE - 1) {
+					c.line[c.len++] = ch;
+				}
+			}
+		}
+		{
+			static auto last_broadcast = std::chrono::steady_clock::now();
+			auto now = std::chrono::steady_clock::now();
+			if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_broadcast).count() > 500) {
+				last_broadcast = now;
+				std::string status;
+				std::string block = buildStatus(server->tracker, status);
+				for (auto &c : server->clients) {
+					if (c.fd >= 0) send(c.fd, block.c_str(), block.size(), SEND_FLAGS);
+				}
+			}
+		}
+	}
+}
+CalibrationServer *calibration_server_create(ConstellationTracker *tracker, const char *socket_path) {
+	std::string path;
+	if (socket_path && socket_path[0] != '\0') path = socket_path;
+	else {
+		const char *runtime = getenv("XDG_RUNTIME_DIR");
+		if (runtime && runtime[0] != '\0') path = std::string(runtime) + "/monado_calibration.sock";
+		else path = "/tmp/monado_calibration.sock";
+	}
+	unlink(path.c_str());
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) return nullptr;
+	struct sockaddr_un addr = {};
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return nullptr; }
+	if (listen(fd, 8) < 0) { close(fd); return nullptr; }
+	int flags = fcntl(fd, F_GETFL, 0);
+	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	CalibrationServer *server = new CalibrationServer();
+	server->tracker = tracker;
+	server->listen_fd = fd;
+	server->socket_path = path;
+	server->clients.resize(MAX_CLIENTS);
+	for (auto &c : server->clients) c.fd = -1;
+	server->running.store(true);
+	server->thread = std::thread(serverThreadFunc, server);
+	return server;
+}
+void calibration_server_destroy(CalibrationServer **server_ptr) {
+	if (!server_ptr || !*server_ptr) return;
+	CalibrationServer *server = *server_ptr;
+	server->running.store(false);
+	if (server->thread.joinable()) server->thread.join();
+	for (auto &c : server->clients) if (c.fd >= 0) close(c.fd);
+	if (server->listen_fd >= 0) { close(server->listen_fd); unlink(server->socket_path.c_str()); }
+	delete server;
+	*server_ptr = nullptr;
+}
+} // namespace xrt::tracking::constellation
+#endif
