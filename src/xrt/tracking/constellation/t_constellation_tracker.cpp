@@ -40,6 +40,12 @@ namespace xrt::tracking::constellation {
 DEBUG_GET_ONCE_LOG_OPTION(constellation_tracker_log, "CONSTELLATION_TRACKER_LOG", U_LOGGING_WARN)
 DEBUG_GET_ONCE_OPTION(constellation_tracker_data_recorder_output, "CONSTELLATION_TRACKER_DATA_RECORDER_OUTPUT", "")
 DEBUG_GET_ONCE_OPTION(constellation_tracker_room_setup_file, "CONSTELLATION_TRACKER_ROOM_SETUP_FILE", "")
+//! Resolve blob ownership across all devices at once instead of device-by-device (better under occlusion).
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_joint_match, "CONSTELLATION_JOINT_MATCH", true)
+//! Reject a per-camera solve whose RMS reprojection error exceeds this many pixels.
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_reprojection_px, "CONSTELLATION_MAX_REPROJECTION_PX", 10.0f)
+//! Largest world-space jump (metres) a device pose may make between samples before it is rejected.
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_jump_m, "CONSTELLATION_MAX_JUMP_M", 0.75f)
 
 // Unconditionally present to allow warning that the feature is not enabled.
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_enable_rerun, "CONSTELLATION_TRACKER_RERUN_ENABLE", false)
@@ -478,13 +484,12 @@ Camera::tryDevicePose(Device *device,
 	}
 
 	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
-		this->pushPose(sample,                   //
-		               device_state,             //
-		               device,                   //
-		               score,                    //
-		               Tcv_cam_device_candidate, //
-		               std::nullopt);            //
-		return true;
+		return this->pushPose(sample,                   //
+		                      device_state,             //
+		                      device,                   //
+		                      score,                    //
+		                      Tcv_cam_device_candidate, //
+		                      std::nullopt);            //
 	}
 
 	return false;
@@ -581,26 +586,129 @@ Camera::tryDeviceBlobRecovery(Device *device,
 	 *       Since a RANSAC has already made an assessment over the validity of the pose, and we already trust that
 	 *       assessment, this shouldn't cause many problems.
 	 */
-	constexpr bool kAlwaysTrustRansac = true;
+	// Require the solve to look like a real match rather than trusting RANSAC unconditionally; a degenerate
+	// solve here is what produced the wild controller poses that then drifted forever.
+	constexpr bool kAlwaysTrustRansac = false;
 
 	if (kAlwaysTrustRansac || POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
 		CT_DEBUG(tracker, "Camera %p RANSAC-PnP recovered pose was good enough for device %d from %u blobs",
 		         (void *)this, device->id, sample.blob_count);
 
-		this->pushPose(sample,                  //
-		               device_state,            //
-		               device,                  //
-		               score,                   //
-		               Tcv_cam_device,          //
-		               &old_optimization_data); //
-
-		return true;
+		return this->pushPose(sample,                  //
+		                      device_state,            //
+		                      device,                  //
+		                      score,                   //
+		                      Tcv_cam_device,          //
+		                      &old_optimization_data); //
 	} else {
 		CT_DEBUG(tracker, "Camera %p RANSAC-PnP recovered pose for device %d from %u blobs was not good enough",
 		         (void *)this, device->id, sample.blob_count);
 	}
 
 	return false;
+}
+
+void
+Camera::assignBlobsGlobally(CameraSample &sample)
+{
+	auto tracker = this->tracker;
+
+	struct Candidate
+	{
+		t_blob *blob;
+		Device *device;
+		t_constellation_tracker_led *led;
+		double sq_error;
+		double depth_m;
+	};
+
+	std::vector<Candidate> candidates;
+
+	/*
+	 * Gather every (blob, LED) match every device could make from its own prediction. We do this before marking
+	 * anything so a device can't claim a blob simply because it was solved first.
+	 */
+	for (std::unique_ptr<Device> &device : tracker->devices) {
+		if (!device->enabled.load()) {
+			continue;
+		}
+
+		std::optional<DeviceState *> state = sample.getDeviceState(device->id);
+		if (!state.has_value() || !state.value()->Tcv_cam_device_predicted.has_value()) {
+			continue;
+		}
+
+		const xrt_pose &Tcv_cam_device = state.value()->Tcv_cam_device_predicted.value().pose;
+
+		pose_metrics_blob_match_info match_info;
+		pose_metrics_match_pose_to_blobs(&Tcv_cam_device, sample.blobs, sample.blob_count,
+		                                 &device->params.led_model, device->id, &this->model, &match_info);
+
+		for (int i = 0; i < match_info.num_visible_leds; i++) {
+			pose_metrics_visible_led_info &led_info = match_info.visible_leds[i];
+			if (led_info.matched_blob == nullptr || led_info.pos_m.z <= 0.0) {
+				continue;
+			}
+
+			const double dx = led_info.pos_px_undistorted.x - led_info.matched_blob->center_undistorted.x;
+			const double dy = led_info.pos_px_undistorted.y - led_info.matched_blob->center_undistorted.y;
+
+			candidates.push_back(Candidate{
+			    .blob = led_info.matched_blob,
+			    .device = device.get(),
+			    .led = led_info.led,
+			    .sq_error = dx * dx + dy * dy,
+			    .depth_m = led_info.pos_m.z,
+			});
+		}
+	}
+
+	if (candidates.empty()) {
+		return;
+	}
+
+	// Start from a clean slate so the joint assignment is the only thing that decides ownership.
+	for (uint32_t i = 0; i < sample.blob_count; i++) {
+		sample.blobs[i].matched_device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID;
+		sample.blobs[i].matched_device_led_id = XRT_CONSTELLATION_INVALID_LED_ID;
+	}
+
+	/*
+	 * The LED nearest to the camera wins a contested blob, because it is the one that is actually visible and is
+	 * occluding the others. A blob and an LED can each only be used once.
+	 */
+	std::sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b) {
+		return a.depth_m < b.depth_m;
+	});
+
+	std::vector<std::pair<t_constellation_device_id_t, t_constellation_led_id_it>> used_leds;
+	used_leds.reserve(candidates.size());
+
+	for (const Candidate &c : candidates) {
+		if (c.blob->matched_device_id != XRT_CONSTELLATION_INVALID_DEVICE_ID) {
+			continue; // A nearer LED already owns this blob.
+		}
+
+		bool led_taken = false;
+		for (const auto &key : used_leds) {
+			if (key.first == c.device->id && key.second == c.led->id) {
+				led_taken = true;
+				break;
+			}
+		}
+		if (led_taken) {
+			continue;
+		}
+
+		c.blob->matched_device_id = c.device->id;
+		c.blob->matched_device_led_id = c.led->id;
+		used_leds.emplace_back(c.device->id, c.led->id);
+
+		CT_DEBUG(tracker,
+		         "Joint match: blob %u at %.1f,%.1f -> device %d LED %d (depth %.2fm, reproj %.1fpx)",
+		         c.blob->blob_id, c.blob->center_undistorted.x, c.blob->center_undistorted.y, c.device->id,
+		         c.led->id, c.depth_m, sqrt(c.sq_error));
+	}
 }
 
 void
@@ -759,14 +867,12 @@ Camera::processSampleSlow(CameraSample &sample)
 			    &cv_camera_gravity_vector,                         //
 			    device->gravity_error_rad,                         //
 			    &score);                                           //
-			if (found_pose) {
-				this->pushPose(sample,         //
-				               device_state,   //
-				               device,         //
-				               score,          //
-				               Tcv_cam_device, //
-				               std::nullopt);  //
-
+			if (found_pose && this->pushPose(sample,         //
+			                                 device_state,   //
+			                                 device,         //
+			                                 score,          //
+			                                 Tcv_cam_device, //
+			                                 std::nullopt)) {
 				// We found a pose for this device in this sample
 				device_state.needs_slow_processing = false;
 			} else {
@@ -844,6 +950,11 @@ Camera::processSampleFast(CameraSample &sample)
 		device_state.Txr_world_device_prior =
 		    prior_pose_valid ? std::optional<xrt_pose>(device_predicted_relation.pose) : std::nullopt;
 		device_state.Tcv_cam_device_predicted = Tcv_cam_device_predicted;
+	}
+
+	// Resolve blob ownership across all devices at once, so occlusion doesn't hand a blob to the wrong device.
+	if (debug_get_bool_option_constellation_joint_match()) {
+		this->assignBlobsGlobally(sample);
 	}
 
 	// Borrowed pointers, only valid while we hold the device lock taken above.
@@ -953,7 +1064,75 @@ Camera::processSampleFast(CameraSample &sample)
 	return need_slow_search;
 }
 
-void
+/*!
+ * Returns true when a per-camera solve is physically plausible enough to publish.
+ *
+ * A RANSAC-PnP solve can succeed on a degenerate or mismatched set of blobs and produce a pose that is wildly
+ * wrong (metres away, or behind the camera). Publishing one of those poisons the device's relation history for
+ * many frames, so gate on the obvious physical invariants before accepting it.
+ */
+static bool
+pose_is_plausible(Device *device,
+                  const xrt_pose &Txr_cam_device,
+                  const std::optional<xrt_pose> &Txr_world_cam,
+                  const pose_metrics &score,
+                  timepoint_ns now_ns,
+                  float max_reprojection_px,
+                  float max_jump_m)
+{
+	// Not enough LEDs matched: the solve is under-constrained and any RANSAC result is a guess.
+	if (score.matched_blobs < 4) {
+		return false;
+	}
+
+	const xrt_pose &p = Txr_cam_device;
+	if (!std::isfinite(p.position.x) || !std::isfinite(p.position.y) || !std::isfinite(p.position.z) ||
+	    !std::isfinite(p.orientation.x) || !std::isfinite(p.orientation.y) ||
+	    !std::isfinite(p.orientation.z) || !std::isfinite(p.orientation.w)) {
+		return false;
+	}
+
+	// The device must be in front of the camera and not implausibly far away.
+	if (p.position.z < 0.1f || p.position.z > 10.0f) {
+		return false;
+	}
+
+	if (score.matched_blobs > 0 && score.reprojection_error > 0.0) {
+		float rms = sqrtf((float)score.reprojection_error / (float)score.matched_blobs);
+		if (rms > max_reprojection_px) {
+			return false;
+		}
+	}
+
+	// World-space sanity, and a cap on how far the device may jump between samples.
+	if (Txr_world_cam.has_value()) {
+		xrt_pose Txr_world_device;
+		math_pose_transform(&Txr_world_cam.value(), &Txr_cam_device, &Txr_world_device);
+
+		if (m_vec3_len(Txr_world_device.position) > 10.0f) {
+			return false;
+		}
+
+		std::unique_lock<os::Mutex> lock(device->data_lock);
+		if (device->locked_data.last_known_pose.has_value()) {
+			const DeviceLastPose &last = device->locked_data.last_known_pose.value();
+
+			// Only cap the jump while the last pose is fresh. After a gap the device may legitimately be
+			// somewhere else entirely, and rejecting it would stop it ever re-acquiring.
+			constexpr timepoint_ns kJumpGateWindowNs = 500 * 1000 * 1000;
+			bool last_is_recent = now_ns > last.timestamp_ns && now_ns - last.timestamp_ns < kJumpGateWindowNs;
+			if (last_is_recent &&
+			    m_vec3_len(m_vec3_sub(Txr_world_device.position, last.Txr_world_device.position)) >
+			        max_jump_m) {
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+bool
 Camera::pushPose(CameraSample &camera_sample,
                  DeviceState &device_state,
                  Device *device,
@@ -1046,14 +1225,34 @@ Camera::pushPose(CameraSample &camera_sample,
 	xrt_pose Txr_cam_device;
 	math_pose_convert_from_opencv(&Tcv_cam_device, &Txr_cam_device);
 
+	// Reject implausible solves before they can poison the relation history. The blobs were already marked
+	// above, so drop them again here or they'd be treated as trusted correspondences for this device.
+	if (!pose_is_plausible(device, Txr_cam_device, camera_sample.Txr_world_cam, score,
+	                       camera_sample.timestamp_ns,
+	                       debug_get_float_option_constellation_max_reprojection_px(),
+	                       debug_get_float_option_constellation_max_jump_m())) {
+		for (uint32_t i = 0; i < camera_sample.blob_count; i++) {
+			t_blob &b = camera_sample.blobs[i];
+			if (b.matched_device_id == device->id) {
+				b.matched_device_led_id = XRT_CONSTELLATION_INVALID_LED_ID;
+				b.matched_device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID;
+			}
+		}
+
+		CT_DEBUG(tracker, "Rejected implausible pose for device %d (%u blobs matched)", device->id,
+		         score.matched_blobs);
+		return false;
+	}
+
 	CT_DEBUG(tracker, "Pose: orient %f %f %f %f pos %f %f %f", Txr_cam_device.orientation.x,
 	         Txr_cam_device.orientation.y, Txr_cam_device.orientation.z, Txr_cam_device.orientation.w,
 	         Txr_cam_device.position.x, Txr_cam_device.position.y, Txr_cam_device.position.z);
 
 	std::shared_ptr<CameraMosaic> mosaic = this->mosaic.lock();
-	U_ASSERT_WEAK_PTR_RET(mosaic,
-	                      "Camera mosaic was destroyed while processing a sample, this should never happen since "
-	                      "the mosaic owns the camera");
+	U_ASSERT_WEAK_PTR_RET(
+	    mosaic, "Camera mosaic was destroyed while processing a sample, this should never happen since "
+	            "the mosaic owns the camera",
+	    false);
 
 	float average_brightness = 0.0f;
 	uint32_t used_blobs = 0;
@@ -1147,6 +1346,7 @@ Camera::pushPose(CameraSample &camera_sample,
 	}
 
 	CT_DEBUG(tracker, "Found pose for device %d", device->id);
+	return true;
 }
 
 /*

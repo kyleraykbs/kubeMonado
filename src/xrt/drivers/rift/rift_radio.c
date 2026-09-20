@@ -34,6 +34,9 @@ rift_update_input(struct xrt_device *device, size_t index, union xrt_input_value
  * Rift Touch Controller device functions
  */
 
+//! How stale a constellation sample may be before the fallback freezes instead of extrapolating.
+#define RIFT_TOUCH_FREEZE_NS (150 * U_TIME_1MS_IN_NS)
+
 static xrt_result_t
 rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
                                        const enum xrt_input_name name,
@@ -47,22 +50,45 @@ rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
 	case XRT_INPUT_TOUCH_AIM_POSE: {
 		struct xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
 
-		if (imu_fusion_get_prediction(controller->input.imu_fusion, (uint64_t)at_timestamp_ns,
-		                              &relation.pose.orientation, &relation.angular_velocity) == 0) {
-			relation.relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
-			                          XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
-			                          XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+		/*
+		 * Primary: the same fused pose the headset uses. The sensor fusion ingests every camera and the
+		 * device IMU at once, so it is both more accurate and steadier than the raw per-camera history.
+		 */
+		if (controller->use_constellation) {
+			if (t_constellation_tracker_get_tracked_pose(controller->constellation_tracker,
+			                                             controller->constellation_device_id,
+			                                             at_timestamp_ns, &relation) < 0) {
+				relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
+			}
+		}
 
-			if (controller->use_constellation) {
-				// borrow the angular velocity from the IMU, but just use the constellation position
-				// and orientation
-				struct xrt_vec3 ang_vel = relation.angular_velocity;
-				m_relation_history_get(controller->constellation_relation_history, at_timestamp_ns,
-				                       &relation);
-				relation.angular_velocity = ang_vel;
-				relation.relation_flags = XRT_SPACE_RELATION_POSITION_VALID_BIT |
-				                          XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
-				                          XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+		/*
+		 * Fallback: the raw per-camera constellation history. When its newest sample is older than the
+		 * freeze window, hold that last good pose instead of letting m_predict_relation extrapolate with a
+		 * stale velocity, which is what sent the controllers flying off to infinity.
+		 */
+		if (relation.relation_flags == 0) {
+			int64_t latest_ns = 0;
+			struct xrt_space_relation latest = XRT_SPACE_RELATION_ZERO;
+
+			if (m_relation_history_get_latest(controller->constellation_relation_history, &latest_ns,
+			                                  &latest)) {
+				int64_t age_ns = at_timestamp_ns > latest_ns ? at_timestamp_ns - latest_ns : 0;
+				if (age_ns > RIFT_TOUCH_FREEZE_NS) {
+					relation = latest;
+				} else {
+					m_relation_history_get(controller->constellation_relation_history, at_timestamp_ns,
+					                       &relation);
+				}
+			}
+		}
+
+		// Last resort: the IMU's 3DoF orientation, so the controller is never fully untracked.
+		if (relation.relation_flags == 0) {
+			if (imu_fusion_get_prediction(controller->input.imu_fusion, (uint64_t)at_timestamp_ns,
+			                              &relation.pose.orientation,
+			                              &relation.angular_velocity) == 0) {
+				relation.relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
 				                          XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
 				                          XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
 			}

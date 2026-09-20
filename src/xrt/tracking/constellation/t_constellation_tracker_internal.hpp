@@ -304,6 +304,15 @@ public: // Methods (t_constellation_tracker.cpp)
 	                      DeviceState &device_state,
 	                      const std::optional<xrt_space_relation> &Tcv_cam_device_prior);
 
+	/*!
+	 * Jointly assigns blobs to devices for this sample, across every enabled device with a predicted pose, before
+	 * any device is solved. Per-device matching runs devices one at a time, so a blob can be handed to the wrong
+	 * device when one device occludes another. Resolving the assignment globally, and letting the LED nearest to
+	 * the camera win a contested blob, gives correct occlusion handling.
+	 */
+	void
+	assignBlobsGlobally(CameraSample &sample);
+
 	void
 	handleProcessingComplete(CameraSample &sample);
 
@@ -314,7 +323,8 @@ public: // Methods (t_constellation_tracker.cpp)
 	bool
 	processSampleFast(CameraSample &sample);
 
-	void
+	//! Publishes a solved pose. Returns false if the solve was rejected as implausible.
+	bool
 	pushPose(CameraSample &camera_sample,
 	         DeviceState &device_state,
 	         Device *device,

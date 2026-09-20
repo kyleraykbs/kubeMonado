@@ -3225,6 +3225,31 @@ SensorFusion::getTrackedPose(t_constellation_device_id_t device_id,
 
 		os_thread_helper_unlock(&this->thread);
 
+		/*
+		 * Freeze rather than dead-reckon when the device is not currently tracked, or when the requested time
+		 * is far past the last solve. Extrapolating an untracked device with its last velocity is what sent
+		 * lost controllers flying off to infinity. Holding the last pose (and reporting out_time_ns as the
+		 * requested time so the caller's m_predict_relation has dt = 0) keeps it stable.
+		 */
+		constexpr timepoint_ns kFrozenAfterNs = 150 * 1000 * 1000;
+		bool tracking = device.tracking_state == DeviceTrackingState::Tracking;
+		bool fresh = requested_time_ns - latest_solve_time_ns <= kFrozenAfterNs;
+		if (!tracking || !fresh) {
+			out_relation = XRT_SPACE_RELATION_ZERO;
+			out_relation.pose = Tcv_world_device;
+			out_relation.relation_flags = static_cast<xrt_space_relation_flags>(
+			    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+			    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
+			out_time_ns = requested_time_ns;
+
+			math_quat_rotate(&out_relation.pose.orientation, &Qcv_imu_model, &out_relation.pose.orientation);
+			math_pose_convert_from_opencv(&out_relation.pose, &out_relation.pose);
+
+			SF_TRACE(this, "Froze pose for device %d (tracking=%d fresh=%d)", device_id, tracking ? 1 : 0,
+			         fresh ? 1 : 0);
+			return;
+		}
+
 		bool integrate_to = true;
 
 		if (requested_time_ns <= latest_solve_time_ns) {
