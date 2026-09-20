@@ -100,6 +100,9 @@ struct FoundDevicePose
 {
 	xrt_pose Tcv_cam_device XRT_POSE_IDENTITY;
 	float average_blob_brightness;
+	//! Confidence, used to break cross-device conflicts (more matched blobs, then lower rms, wins).
+	uint32_t matched_blobs{0};
+	float rms{0.0f};
 	RawPoseCovarianceMatrix covariance;
 };
 

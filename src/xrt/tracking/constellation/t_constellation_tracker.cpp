@@ -45,7 +45,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(constellation_joint_match, "CONSTELLATION_JOINT_MATCH
 //! Reject a per-camera solve whose RMS reprojection error exceeds this many pixels.
 DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_reprojection_px, "CONSTELLATION_MAX_REPROJECTION_PX", 10.0f)
 //! Largest world-space jump (metres) a device pose may make between samples before it is rejected.
-DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_jump_m, "CONSTELLATION_MAX_JUMP_M", 0.75f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_jump_m, "CONSTELLATION_MAX_JUMP_M", 2.0f)
 
 // Unconditionally present to allow warning that the feature is not enabled.
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_enable_rerun, "CONSTELLATION_TRACKER_RERUN_ENABLE", false)
@@ -1057,6 +1057,72 @@ Camera::processSampleFast(CameraSample &sample)
 		need_slow_search = true;
 	}
 
+	/*
+	 * Cross-device conflict gate. Two devices cannot occupy the same space, so if two poses accepted
+	 * this sample overlap, one of them is wrong. Keep the more confident solve (more matched blobs, then
+	 * lower rms); the HMD (the device with the larger LED model) always wins. Dropping the loser's blobs
+	 * stops it feeding the fusion a wrong-identity correspondence and lets it re-acquire on the slow path.
+	 */
+	if (sample.Txr_world_cam.has_value()) {
+		struct Acc
+		{
+			DeviceState *state;
+			Device *device;
+			xrt_vec3 pos;
+			uint32_t matched;
+			float rms;
+			uint32_t led_count;
+			bool dropped;
+		};
+		std::vector<Acc> acc;
+		for (auto &device : tracker->devices) {
+			std::optional<DeviceState *> st_opt = sample.getDeviceState(device->id);
+			if (!st_opt.has_value() || !st_opt.value()->found_pose.has_value()) {
+				continue;
+			}
+			DeviceState &st = *st_opt.value();
+			xrt_pose Txr_cam_device;
+			math_pose_convert_from_opencv(&st.found_pose->Tcv_cam_device, &Txr_cam_device);
+			xrt_pose Txr_world_device;
+			math_pose_transform(&sample.Txr_world_cam.value(), &Txr_cam_device, &Txr_world_device);
+			acc.push_back({&st, device.get(), Txr_world_device.position, st.found_pose->matched_blobs,
+			               st.found_pose->rms, (uint32_t)device->params.led_model.led_count, false});
+		}
+
+		constexpr float kOverlapM = 0.08f;
+		for (size_t i = 0; i < acc.size(); i++) {
+			for (size_t j = i + 1; j < acc.size(); j++) {
+				if (m_vec3_len(m_vec3_sub(acc[i].pos, acc[j].pos)) > kOverlapM) {
+					continue;
+				}
+				// Higher confidence wins; larger LED model (the HMD) beats that.
+				bool i_wins = (acc[i].led_count > acc[j].led_count) ||
+				              (acc[i].led_count == acc[j].led_count &&
+				               (acc[i].matched > acc[j].matched ||
+				                (acc[i].matched == acc[j].matched && acc[i].rms <= acc[j].rms)));
+				acc[i_wins ? j : i].dropped = true;
+			}
+		}
+
+		for (auto &a : acc) {
+			if (!a.dropped) {
+				continue;
+			}
+			CT_DEBUG(tracker, "Overlap gate: dropping device %d pose (%u blobs, rms %.1f)", a.device->id,
+			         a.matched, a.rms);
+			for (uint32_t k = 0; k < sample.blob_count; k++) {
+				t_blob &b = sample.blobs[k];
+				if (b.matched_device_id == a.device->id) {
+					b.matched_device_led_id = XRT_CONSTELLATION_INVALID_LED_ID;
+					b.matched_device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID;
+				}
+			}
+			a.state->found_pose.reset();
+			a.state->needs_slow_processing = true;
+			need_slow_search = true;
+		}
+	}
+
 	this->debugScribbleSample(sample, true);
 
 	// Only save samples on the fast processing thread, since the slow processing thread is *triggered* by the fast
@@ -1091,8 +1157,8 @@ pose_is_plausible(Device *device,
                   const char **reason = nullptr)
 {
 	// Not enough LEDs matched: the solve is under-constrained and any RANSAC result is a guess.
-	if (score.matched_blobs < 4) {
-		if (reason) *reason = "matched_blobs<4";
+	if (score.matched_blobs < 5) {
+		if (reason) *reason = "matched_blobs<5";
 		return false;
 	}
 
@@ -1138,15 +1204,22 @@ pose_is_plausible(Device *device,
 		if (device->locked_data.last_known_pose.has_value()) {
 			const DeviceLastPose &last = device->locked_data.last_known_pose.value();
 
-			// Only cap the jump while the last pose is fresh. After a gap the device may legitimately be
-			// somewhere else entirely, and rejecting it would stop it ever re-acquiring.
-			constexpr timepoint_ns kJumpGateWindowNs = 500 * 1000 * 1000;
-			bool last_is_recent = now_ns > last.timestamp_ns && now_ns - last.timestamp_ns < kJumpGateWindowNs;
-			if (last_is_recent &&
-			    m_vec3_len(m_vec3_sub(Txr_world_device.position, last.Txr_world_device.position)) >
-			        max_jump_m) {
-				if (reason) *reason = "jump";
-				return false;
+			/*
+			 * Velocity-scaled continuity gate. A fixed distance/short-window cliff both rejects genuine
+			 * fast re-acquisition and lets swaps between two nearby controllers through. Allow ~8 m/s
+			 * plus a small margin, growing with the gap since the last pose, capped for sanity.
+			 */
+			if (now_ns > last.timestamp_ns) {
+				double dt_s = (double)(now_ns - last.timestamp_ns) * 1e-9;
+				float allowed = 0.1f + 8.0f * (float)dt_s;
+				if (allowed > max_jump_m) {
+					allowed = max_jump_m;
+				}
+				if (m_vec3_len(m_vec3_sub(Txr_world_device.position, last.Txr_world_device.position)) >
+				    allowed) {
+					if (reason) *reason = "jump";
+					return false;
+				}
 			}
 		}
 	}
@@ -1298,6 +1371,8 @@ Camera::pushPose(CameraSample &camera_sample,
 	device_state.found_pose = {
 	    .Tcv_cam_device = Tcv_cam_device,
 	    .average_blob_brightness = average_brightness,
+	    .matched_blobs = score.matched_blobs,
+	    .rms = score.matched_blobs > 0 ? sqrtf((float)score.reprojection_error / (float)score.matched_blobs) : 0.0f,
 	    .covariance = {},
 	};
 	std::memcpy(device_state.found_pose->covariance, covariance, sizeof(RawPoseCovarianceMatrix));

@@ -114,6 +114,21 @@ touch_controller_constellation_tracking_source_get_tracked_pose(
 
 	*out_relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
 
+	/*
+	 * Expire the raw per-camera history as a prior: once it is stale it actively biases the tracker's
+	 * search toward the wrong place and prevents re-acquisition. Returning no prior lets the tracker run
+	 * without CS_FLAG_HAVE_POSE_PRIOR instead.
+	 */
+	const timepoint_ns kPriorExpiryNs = 300 * U_TIME_1MS_IN_NS;
+	int64_t latest_ns = 0;
+	struct xrt_space_relation latest = XRT_SPACE_RELATION_ZERO;
+	if (!m_relation_history_get_latest(controller->constellation_relation_history, &latest_ns, &latest)) {
+		return;
+	}
+	if (when_ns > latest_ns && when_ns - latest_ns > kPriorExpiryNs) {
+		return;
+	}
+
 	m_relation_history_get(controller->constellation_relation_history, when_ns, out_relation);
 }
 
