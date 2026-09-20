@@ -88,9 +88,17 @@ touch_controller_pose_filter_update(struct rift_touch_controller *controller,
 	}
 
 	double dt = (double)(ts - controller->pose_filter.ts_ns) * 1e-9;
-	if (dt <= 1e-4) {
+	if (dt < 0.005) {
+		/*
+		 * Back-to-back solves (multiple cameras, same exposure) come in microseconds apart. Deriving a
+		 * velocity from that interval explodes and the prediction flies. Only update the filter on a real
+		 * frame interval; ignore the same-frame duplicates.
+		 */
 		os_mutex_unlock(&controller->input.mutex);
 		return;
+	}
+	if (dt > 0.1) {
+		dt = 0.1;
 	}
 
 	// Weight the update by solve quality; sparse/dirty solves move the pose less.
@@ -119,8 +127,15 @@ touch_controller_pose_filter_update(struct rift_touch_controller *controller,
 	struct xrt_vec3 inst_vel =
 	    m_vec3_mul_scalar(m_vec3_sub(new_pos, controller->pose_filter.pos), 1.0f / (float)dt);
 	controller->pose_filter.vel =
-	    m_vec3_mul_scalar(m_vec3_add(controller->pose_filter.vel, inst_vel), 0.5f);
+	    m_vec3_add(m_vec3_mul_scalar(controller->pose_filter.vel, 0.7f),
+	               m_vec3_mul_scalar(inst_vel, 0.3f));
 	controller->pose_filter.pos = new_pos;
+	{
+		float vlen = m_vec3_len(controller->pose_filter.vel);
+		if (vlen > 6.0f) {
+			controller->pose_filter.vel = m_vec3_mul_scalar(controller->pose_filter.vel, 6.0f / vlen);
+		}
+	}
 
 	// Angular velocity from the change in vision orientation, for prediction between updates.
 	struct xrt_quat dq =
@@ -140,6 +155,11 @@ touch_controller_pose_filter_update(struct rift_touch_controller *controller,
 		if (s > 1e-4f && angle < 1.5f) {
 			struct xrt_vec3 axis = {dq.x / s, dq.y / s, dq.z / s};
 			controller->pose_filter.ang_vel = m_vec3_mul_scalar(axis, angle / (float)ddt);
+			float wlen = m_vec3_len(controller->pose_filter.ang_vel);
+			if (wlen > 12.0f) {
+				controller->pose_filter.ang_vel =
+				    m_vec3_mul_scalar(controller->pose_filter.ang_vel, 12.0f / wlen);
+			}
 		}
 	}
 	controller->pose_filter.prev_ori = world_pose->orientation;
@@ -678,7 +698,8 @@ rift_touch_controller_create(struct rift_hmd *hmd,
 
 	controller->use_constellation = false;
 	const char *pose_filter_env = getenv("RIFT_TOUCH_POSE_FILTER");
-	controller->use_pose_filter = (pose_filter_env == NULL) || (pose_filter_env[0] != '0');
+	// Opt-in while it is being stabilised; default is the previous fusion path.
+	controller->use_pose_filter = (pose_filter_env != NULL) && (pose_filter_env[0] == '1');
 	controller->pose_filter.has = false;
 	controller->constellation_device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID;
 	controller->constellation_tracking_source.get_tracked_pose =
