@@ -178,7 +178,7 @@ run_room_calibration_func(void *ptr)
 	    .Qcv_imu_model = result.imu.Qcv_imu_model,
 	};
 	if (!is_valid_imu_quat(calibration.Qcv_imu_model)) {
-		auto existing = tracker->pending_imu_calibrations.find(result.device_id);
+		auto existing = tracker->pending_imu_calibrations.find(tracker->deviceName(result.device_id));
 		if (existing != tracker->pending_imu_calibrations.end() &&
 		    is_valid_imu_quat(existing->second.Qcv_imu_model)) {
 			calibration.Qcv_imu_model = existing->second.Qcv_imu_model;
@@ -191,7 +191,7 @@ run_room_calibration_func(void *ptr)
 		        result.device_id);
 	}
 	tracker->sensor_fusion->setDeviceImuCalibration(result.device_id, calibration);
-	tracker->pending_imu_calibrations[result.device_id] = calibration;
+	tracker->pending_imu_calibrations[tracker->deviceName(result.device_id)] = calibration;
 
 	{
 		std::unique_lock<os::Mutex> lock(tracker->offline_sensor_calibration_lock);
@@ -1651,14 +1651,14 @@ ConstellationTracker::loadRoomSetup()
 				}
 			}
 		} else if (line.rfind("imu ", 0) == 0) {
-			int device_id;
+			char name[64] = {};
 			sensor_fusion::DeviceImuCalibration calib{};
-			if (sscanf(line.c_str(), "imu %d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf",
-			           &device_id, &calib.accel_bias.x, &calib.accel_bias.y, &calib.accel_bias.z,
-			           &calib.gyro_bias.x, &calib.gyro_bias.y, &calib.gyro_bias.z, &calib.accel_scale.x,
-			           &calib.accel_scale.y, &calib.accel_scale.z, &calib.Qcv_imu_model.x,
-			           &calib.Qcv_imu_model.y, &calib.Qcv_imu_model.z, &calib.Qcv_imu_model.w) == 14) {
-				this->pending_imu_calibrations[(t_constellation_device_id_t)device_id] = calib;
+			if (sscanf(line.c_str(), "imu %63s %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf", name,
+			           &calib.accel_bias.x, &calib.accel_bias.y, &calib.accel_bias.z, &calib.gyro_bias.x,
+			           &calib.gyro_bias.y, &calib.gyro_bias.z, &calib.accel_scale.x, &calib.accel_scale.y,
+			           &calib.accel_scale.z, &calib.Qcv_imu_model.x, &calib.Qcv_imu_model.y,
+			           &calib.Qcv_imu_model.z, &calib.Qcv_imu_model.w) == 14) {
+				this->pending_imu_calibrations[std::string(name)] = calib;
 				imus_loaded++;
 			}
 		}
@@ -1701,11 +1701,12 @@ ConstellationTracker::saveRoomSetup(const offline_sensor_calibration::Calibratio
 		}
 	}
 
-	out << "imu " << (int)result.device_id << " " << result.imu.accel_bias.x << " " << result.imu.accel_bias.y << " "
-	    << result.imu.accel_bias.z << " " << result.imu.gyro_bias.x << " " << result.imu.gyro_bias.y << " "
-	    << result.imu.gyro_bias.z << " " << result.imu.accel_scale.x << " " << result.imu.accel_scale.y << " "
-	    << result.imu.accel_scale.z << " " << result.imu.Qcv_imu_model.x << " " << result.imu.Qcv_imu_model.y << " "
-	    << result.imu.Qcv_imu_model.z << " " << result.imu.Qcv_imu_model.w << "\n";
+	out << "imu " << this->deviceName(result.device_id) << " " << result.imu.accel_bias.x << " "
+	    << result.imu.accel_bias.y << " " << result.imu.accel_bias.z << " " << result.imu.gyro_bias.x << " "
+	    << result.imu.gyro_bias.y << " " << result.imu.gyro_bias.z << " " << result.imu.accel_scale.x << " "
+	    << result.imu.accel_scale.y << " " << result.imu.accel_scale.z << " " << result.imu.Qcv_imu_model.x << " "
+	    << result.imu.Qcv_imu_model.y << " " << result.imu.Qcv_imu_model.z << " " << result.imu.Qcv_imu_model.w
+	    << "\n";
 
 	if (!out.good()) {
 		CT_WARN(this, "Failed to write room setup file: %s", tmp_file.c_str());
@@ -1883,7 +1884,7 @@ ConstellationTracker::tryCalibrateDeviceImus()
 			continue;
 		}
 		this->sensor_fusion->setDeviceImuCalibration(id, calibration);
-		this->pending_imu_calibrations[id] = calibration;
+		this->pending_imu_calibrations[this->deviceName(id)] = calibration;
 		this->device_imus_solved.insert(id);
 		unsolved--;
 
@@ -1965,10 +1966,13 @@ ConstellationTracker::addDevice(t_constellation_tracker_device_params *params, t
 
 	this->sensor_fusion->addDevice(id, new_device->search_model->led_model);
 
-	auto it = this->pending_imu_calibrations.find(id);
+	// deviceName() would deadlock here (we hold device_lock), and the device is at the back anyway.
+	std::string dev_key = new_device->params.name[0] != '\0' ? std::string(new_device->params.name)
+	                                                         : ("dev" + std::to_string((unsigned)id));
+	auto it = this->pending_imu_calibrations.find(dev_key);
 	if (it != this->pending_imu_calibrations.end()) {
 		this->sensor_fusion->setDeviceImuCalibration(id, it->second);
-		CT_INFO(this, "Applied saved IMU calibration for device %d", id);
+		CT_INFO(this, "Applied saved IMU calibration for device %s", dev_key.c_str());
 	}
 
 	/*
@@ -2017,6 +2021,20 @@ ConstellationTracker::removeDevice(t_constellation_device_id_t device_id)
 
 	// Remove the device
 	this->devices.erase(this->devices.begin() + index);
+}
+
+std::string
+ConstellationTracker::deviceName(t_constellation_device_id_t device_id)
+{
+	std::shared_lock lock(this->device_lock);
+	for (const auto &dev : this->devices) {
+		if (dev->id == device_id) {
+			return std::string(dev->params.name);
+		}
+	}
+	char buf[32];
+	snprintf(buf, sizeof(buf), "dev%u", (unsigned)device_id);
+	return std::string(buf);
 }
 
 void
@@ -2116,7 +2134,7 @@ ConstellationTracker::saveRoomSetupCurrent()
 
 	for (auto &kv : this->pending_imu_calibrations) {
 		auto &calib = kv.second;
-		out << "imu " << (int)kv.first << " " << calib.accel_bias.x << " " << calib.accel_bias.y << " "
+		out << "imu " << kv.first << " " << calib.accel_bias.x << " " << calib.accel_bias.y << " "
 		    << calib.accel_bias.z << " " << calib.gyro_bias.x << " " << calib.gyro_bias.y << " "
 		    << calib.gyro_bias.z << " " << calib.accel_scale.x << " " << calib.accel_scale.y << " "
 		    << calib.accel_scale.z << " " << calib.Qcv_imu_model.x << " " << calib.Qcv_imu_model.y << " "

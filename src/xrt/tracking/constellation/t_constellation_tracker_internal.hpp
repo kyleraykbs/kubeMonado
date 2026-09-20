@@ -495,7 +495,8 @@ public: // Fields
 	std::unique_ptr<sensor_fusion::SensorFusion> sensor_fusion{};
 
 	std::string room_setup_file;
-	std::map<t_constellation_device_id_t, sensor_fusion::DeviceImuCalibration> pending_imu_calibrations;
+	//! Keyed by the device's stable name (see t_constellation_tracker_device_params::name), not device id.
+	std::map<std::string, sensor_fusion::DeviceImuCalibration> pending_imu_calibrations;
 
 	//! Second calibration phase: solve each remaining device's IMU against the already-solved cameras.
 	bool calibrating_device_imus{false};
@@ -559,6 +560,10 @@ public: // Methods
 
 	void
 	removeDevice(t_constellation_device_id_t device_id);
+
+	//! Stable per-device key for saved data (device id can reorder between sessions).
+	std::string
+	deviceName(t_constellation_device_id_t device_id);
 
 	void
 	getTrackedPose(t_constellation_device_id_t device_id, timepoint_ns when_ns, xrt_space_relation &out_relation);

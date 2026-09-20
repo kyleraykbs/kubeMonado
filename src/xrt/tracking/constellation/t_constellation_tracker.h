@@ -81,6 +81,13 @@ struct t_constellation_tracker_device_params
 	struct t_constellation_tracker_led_model led_model;
 
 	/*
+	 * Stable identity for this device (e.g. the Rift device type / serial). Saved per-device data such as
+	 * IMU calibration is keyed by this, never by the transient constellation device id which can swap
+	 * between sessions (which would apply the left controller's frame to the right one).
+	 */
+	char name[64];
+
+	/*
 	 * An optional tracking source to give the constellation tracker extra information to better throw out bad
 	 * guesses when finding the device.
 	 */

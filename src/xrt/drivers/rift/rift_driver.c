@@ -1536,6 +1536,7 @@ rift_add_to_constellation_tracker(struct rift_hmd *hmd, struct t_constellation_t
 {
 	struct t_constellation_tracker_device_params params = {
 	    .led_model = hmd->led_model,
+	    .name = "hmd",
 	    .tracking_source = &hmd->constellation_tracking_source,
 	};
 
@@ -1587,6 +1588,9 @@ rift_add_touch_controller_to_constellation_tracker(struct rift_hmd *hmd, struct 
 	    .led_model = controller->input.calibration.led_model,
 	    .tracking_source = &controller->constellation_tracking_source,
 	};
+	// Stable identity: the Rift device type (2/3) is fixed per physical controller, unlike the
+	// constellation device id which can reorder between sessions.
+	snprintf(controller_params.name, sizeof(controller_params.name), "touch%u", controller->device_type);
 
 	int ret = t_constellation_tracker_add_device(hmd->constellation_tracker, &controller_params,
 	                                             &controller->constellation_device,
