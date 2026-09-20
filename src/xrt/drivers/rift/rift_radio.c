@@ -336,14 +336,14 @@ rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
 	case XRT_INPUT_TOUCH_GRIP_POSE:
 	case XRT_INPUT_TOUCH_AIM_POSE: {
 		struct xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
+		int source = -1; // 1 estimator, 2 fusion, 3 raw history, 4 imu
 
 		/*
-		 * Primary: the controller's own estimator, built from the per-camera world solves (the pose the
-		 * debug top-down view shows) plus a vision-derived angular velocity. It never goes Lost/freezes
-		 * and is decoupled from the global fusion, which handles sparse controller observations badly.
+		 * Primary: the controller's own estimator
 		 */
-		if (controller->use_pose_filter) {
-			touch_controller_pose_filter_get(controller, at_timestamp_ns, &relation);
+		if (controller->use_pose_filter &&
+		    touch_controller_pose_filter_get(controller, at_timestamp_ns, &relation)) {
+			source = 1;
 		}
 
 		/*
@@ -355,6 +355,9 @@ rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
 			                                             at_timestamp_ns, &relation) < 0) {
 				relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
 			}
+		}
+		if (source < 0 && relation.relation_flags != 0) {
+			source = 2;
 		}
 
 		/*
@@ -391,6 +394,9 @@ rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
 				}
 			}
 		}
+		if (source < 0 && relation.relation_flags != 0) {
+			source = 3;
+		}
 
 		// Last resort: the IMU's 3DoF orientation, so the controller is never fully untracked.
 		if (relation.relation_flags == 0) {
@@ -400,6 +406,16 @@ rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
 				relation.relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
 				                          XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
 				                          XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+			}
+		}
+		if (source < 0 && relation.relation_flags != 0) {
+			source = 4;
+		}
+		{
+			static int s_source_log = 0;
+			if (((++s_source_log) % 300) == 0) {
+				HMD_DEBUG(controller->hmd, "Touch %d pose source %d flags 0x%x at %" PRIi64,
+				          controller->device_type, source, relation.relation_flags, at_timestamp_ns);
 			}
 		}
 

@@ -3234,6 +3234,23 @@ SensorFusion::getTrackedPose(t_constellation_device_id_t device_id,
 		constexpr timepoint_ns kFrozenAfterNs = 150 * 1000 * 1000;
 		bool tracking = device.tracking_state == DeviceTrackingState::Tracking;
 		bool fresh = requested_time_ns - latest_solve_time_ns <= kFrozenAfterNs;
+		{
+			// Instrumentation: how often is each device frozen, and by how much is the solve stale?
+			static uint64_t s_frozen[8] = {0};
+			static uint64_t s_total[8] = {0};
+			uint32_t di = fusion_device_idx < 8 ? fusion_device_idx : 0;
+			s_total[di]++;
+			if (!tracking || !fresh) {
+				s_frozen[di]++;
+			}
+			if ((s_total[di] % 300) == 0) {
+				SF_DEBUG(this,
+				         "getTrackedPose device %d: frozen %llu/%llu (tracking=%d fresh=%d age=%.1fms)",
+				         device_id, (unsigned long long)s_frozen[di], (unsigned long long)s_total[di],
+				         tracking ? 1 : 0, fresh ? 1 : 0,
+				         (double)(requested_time_ns - latest_solve_time_ns) * 1e-6);
+			}
+		}
 		if (!tracking || !fresh) {
 			out_relation = XRT_SPACE_RELATION_ZERO;
 			out_relation.pose = Tcv_world_device;
