@@ -96,8 +96,8 @@ rift_touch_calibration_parse(const char *calibration_data,
 		    U_TYPED_ARRAY_CALLOC(struct t_constellation_tracker_led, out_calibration->led_model.led_count);
 		out_calibration->led_model.match_parameters =
 		    (struct t_constellation_tracker_led_model_match_parameters){
-		        .min_leds_for_correspondence_search_without_prior = 7,
-		        .min_leds_for_correspondence_search_with_prior = 5,
+		        .min_leds_for_correspondence_search_without_prior = 5,
+		        .min_leds_for_correspondence_search_with_prior = 4,
 		    };
 
 		for (size_t i = 0; i < out_calibration->led_model.led_count; i++) {

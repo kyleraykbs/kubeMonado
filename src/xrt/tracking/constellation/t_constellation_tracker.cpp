@@ -1091,8 +1091,8 @@ pose_is_plausible(Device *device,
                   const char **reason = nullptr)
 {
 	// Not enough LEDs matched: the solve is under-constrained and any RANSAC result is a guess.
-	if (score.matched_blobs < 5) {
-		if (reason) *reason = "matched_blobs<5";
+	if (score.matched_blobs < 4) {
+		if (reason) *reason = "matched_blobs<4";
 		return false;
 	}
 
