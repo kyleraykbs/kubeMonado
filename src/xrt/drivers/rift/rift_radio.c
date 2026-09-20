@@ -112,7 +112,7 @@ touch_controller_pose_filter_apply(struct rift_touch_controller *controller,
 	    m_vec3_add(controller->pose_filter.pos, m_vec3_mul_scalar(controller->pose_filter.vel, (float)dt));
 	struct xrt_vec3 err = m_vec3_sub(world_pose->position, pred);
 
-	float gate = 0.05f + 6.0f * (float)dt;
+	float gate = 0.03f + 4.0f * (float)dt;
 	if (m_vec3_len(err) > gate) {
 		// Outlier: hold the prediction and decay velocity rather than jump to it.
 		controller->pose_filter.pos = pred;
@@ -126,13 +126,13 @@ touch_controller_pose_filter_apply(struct rift_touch_controller *controller,
 	struct xrt_vec3 inst_vel =
 	    m_vec3_mul_scalar(m_vec3_sub(new_pos, controller->pose_filter.pos), 1.0f / (float)dt);
 	controller->pose_filter.vel =
-	    m_vec3_add(m_vec3_mul_scalar(controller->pose_filter.vel, 0.7f),
-	               m_vec3_mul_scalar(inst_vel, 0.3f));
+	    m_vec3_add(m_vec3_mul_scalar(controller->pose_filter.vel, 0.85f),
+	               m_vec3_mul_scalar(inst_vel, 0.15f));
 	controller->pose_filter.pos = new_pos;
 	{
 		float vlen = m_vec3_len(controller->pose_filter.vel);
-		if (vlen > 6.0f) {
-			controller->pose_filter.vel = m_vec3_mul_scalar(controller->pose_filter.vel, 6.0f / vlen);
+		if (vlen > 3.0f) {
+			controller->pose_filter.vel = m_vec3_mul_scalar(controller->pose_filter.vel, 3.0f / vlen);
 		}
 	}
 
@@ -291,8 +291,14 @@ touch_controller_pose_filter_get(struct rift_touch_controller *controller,
 		dt = 0.25;
 	}
 
+	// Position only extrapolates a short horizon (a stale velocity must not launch the controller); the
+	// rotation can ride the angular velocity longer.
+	double dt_pos = dt;
+	if (dt_pos > 0.05) {
+		dt_pos = 0.05;
+	}
 	struct xrt_vec3 pos =
-	    m_vec3_add(controller->pose_filter.pos, m_vec3_mul_scalar(controller->pose_filter.vel, (float)dt));
+	    m_vec3_add(controller->pose_filter.pos, m_vec3_mul_scalar(controller->pose_filter.vel, (float)dt_pos));
 	struct xrt_quat ori = controller->pose_filter.ori;
 	float wmag = m_vec3_len(controller->pose_filter.ang_vel);
 	if (wmag > 1e-3f) {
@@ -443,7 +449,8 @@ touch_controller_constellation_tracking_source_get_tracked_pose(
 		                  (when_ns - controller->pose_filter.ts_ns) < kEstimatorFreshNs;
 		os_mutex_unlock(&controller->input.mutex);
 	}
-	if (estimator_fresh && touch_controller_pose_filter_get(controller, when_ns, out_relation)) {
+	if (controller->use_pose_filter && estimator_fresh &&
+	    touch_controller_pose_filter_get(controller, when_ns, out_relation)) {
 		return;
 	}
 
