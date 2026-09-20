@@ -3226,44 +3226,34 @@ SensorFusion::getTrackedPose(t_constellation_device_id_t device_id,
 		os_thread_helper_unlock(&this->thread);
 
 		/*
-		 * Freeze rather than dead-reckon when the device is not currently tracked, or when the requested time
-		 * is far past the last solve. Extrapolating an untracked device with its last velocity is what sent
-		 * lost controllers flying off to infinity. Holding the last pose (and reporting out_time_ns as the
-		 * requested time so the caller's m_predict_relation has dt = 0) keeps it stable.
+		 * Coast instead of freezing. A frozen device holds its last pose and then snaps, which is the lag and
+		 * stutter players feel. Dead-reckon with the IMU to the requested time, but damp the velocity over the
+		 * gap and cap the total coast so a lost device can't run away; report position valid-but-not-tracked
+		 * while coasting and keep orientation tracked from the IMU. Past the cap, report nothing.
 		 */
-		constexpr timepoint_ns kFrozenAfterNs = 150 * 1000 * 1000;
+		constexpr timepoint_ns kCoastMaxNs = 500 * 1000 * 1000;
+		constexpr timepoint_ns kCoastStartNs = 150 * 1000 * 1000;
 		bool tracking = device.tracking_state == DeviceTrackingState::Tracking;
-		bool fresh = requested_time_ns - latest_solve_time_ns <= kFrozenAfterNs;
+		timepoint_ns solve_age_ns =
+		    requested_time_ns > latest_solve_time_ns ? requested_time_ns - latest_solve_time_ns : 0;
+		bool coasting = !tracking || solve_age_ns > kCoastStartNs;
 		{
-			// Instrumentation: how often is each device frozen, and by how much is the solve stale?
-			static uint64_t s_frozen[8] = {0};
+			static uint64_t s_coast[8] = {0};
 			static uint64_t s_total[8] = {0};
 			uint32_t di = fusion_device_idx < 8 ? fusion_device_idx : 0;
 			s_total[di]++;
-			if (!tracking || !fresh) {
-				s_frozen[di]++;
+			if (coasting) {
+				s_coast[di]++;
 			}
 			if ((s_total[di] % 300) == 0) {
-				SF_DEBUG(this,
-				         "getTrackedPose device %d: frozen %llu/%llu (tracking=%d fresh=%d age=%.1fms)",
-				         device_id, (unsigned long long)s_frozen[di], (unsigned long long)s_total[di],
-				         tracking ? 1 : 0, fresh ? 1 : 0,
-				         (double)(requested_time_ns - latest_solve_time_ns) * 1e-6);
+				SF_DEBUG(this, "getTrackedPose device %d: coast %llu/%llu (tracking=%d age=%.1fms)", device_id,
+				         (unsigned long long)s_coast[di], (unsigned long long)s_total[di], tracking ? 1 : 0,
+				         (double)solve_age_ns * 1e-6);
 			}
 		}
-		if (!tracking || !fresh) {
+		if (coasting && solve_age_ns > kCoastMaxNs) {
 			out_relation = XRT_SPACE_RELATION_ZERO;
-			out_relation.pose = Tcv_world_device;
-			out_relation.relation_flags = static_cast<xrt_space_relation_flags>(
-			    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
-			    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
 			out_time_ns = requested_time_ns;
-
-			math_quat_rotate(&out_relation.pose.orientation, &Qcv_imu_model, &out_relation.pose.orientation);
-			math_pose_convert_from_opencv(&out_relation.pose, &out_relation.pose);
-
-			SF_TRACE(this, "Froze pose for device %d (tracking=%d fresh=%d)", device_id, tracking ? 1 : 0,
-			         fresh ? 1 : 0);
 			return;
 		}
 
@@ -3307,6 +3297,13 @@ SensorFusion::getTrackedPose(t_constellation_device_id_t device_id,
 		}
 
 		if (integrate_to) {
+			if (coasting) {
+				// Damp the coast so a lost device stops advancing instead of running away.
+				double damp = exp(-(double)solve_age_ns / 1.5e8);
+				world_velocity.x *= damp;
+				world_velocity.y *= damp;
+				world_velocity.z *= damp;
+			}
 			integrateToTimestamp(                                                 //
 			    world_gravity_mag,                                                //
 			    latest_solve_time_ns,                                             //
@@ -3346,6 +3343,14 @@ SensorFusion::getTrackedPose(t_constellation_device_id_t device_id,
 		         out_relation.linear_velocity.x, out_relation.linear_velocity.y, out_relation.linear_velocity.z,
 		         out_relation.angular_velocity.x, out_relation.angular_velocity.y,
 		         out_relation.angular_velocity.z);
+
+		if (coasting) {
+			// Position is a guess while coasting: valid but not tracked. Orientation rides the IMU.
+			out_relation.relation_flags = static_cast<xrt_space_relation_flags>(
+			    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+			    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT |
+			    XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+		}
 
 		return;
 	}
