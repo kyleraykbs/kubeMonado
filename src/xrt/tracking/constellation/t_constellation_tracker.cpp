@@ -186,6 +186,7 @@ run_room_calibration_func(void *ptr)
 	}
 	calib->beginCollectingData();
 	tracker->device_imu_phase_start_ns = os_monotonic_get_ns();
+	tracker->device_imu_last_attempt.clear();
 	tracker->calibrating_device_imus = true;
 
 	return nullptr;
@@ -1564,9 +1565,10 @@ ConstellationTracker::tryCalibrateDeviceImus()
 		return;
 	}
 
-	// Don't collect forever if a device never shows up.
+	// Wait for controllers to show up (up to a timeout) instead of finishing immediately, so the user can
+	// turn them on after the camera phase.
 	const timepoint_ns now = os_monotonic_get_ns();
-	const timepoint_ns phase_timeout = 180 * U_TIME_1S_IN_NS;
+	const timepoint_ns phase_timeout = (timepoint_ns)300 * U_TIME_1S_IN_NS;
 
 	std::vector<t_constellation_device_id_t> ids;
 	{
@@ -1577,23 +1579,28 @@ ConstellationTracker::tryCalibrateDeviceImus()
 	}
 
 	const size_t min_samples = 300;
-	bool all_done = true;
+	size_t non_camera_count = 0;
+	size_t unsolved = 0;
+	bool solved_any = false;
 
 	for (t_constellation_device_id_t id : ids) {
-		if (id == this->camera_calibration_device_id || this->device_imus_solved.count(id) != 0) {
+		if (id == this->camera_calibration_device_id) {
 			continue;
 		}
+		non_camera_count++;
+		if (this->device_imus_solved.count(id) != 0) {
+			continue;
+		}
+		unsolved++;
 
 		size_t n = calib->numCameraSamplesForDevice(id);
 		if (n < min_samples) {
-			all_done = false;
 			continue;
 		}
 
 		// Space out attempts so a failing solve isn't retried on every single sample.
 		size_t last = this->device_imu_last_attempt[id];
 		if (last != 0 && n < last + min_samples) {
-			all_done = false;
 			continue;
 		}
 		this->device_imu_last_attempt[id] = n;
@@ -1601,7 +1608,6 @@ ConstellationTracker::tryCalibrateDeviceImus()
 		offline_sensor_calibration::CalibrationResult result;
 		if (!calib->optimize(result, id)) {
 			CT_WARN(this, "IMU calibration for device %d failed, retrying with more samples", id);
-			all_done = false;
 			continue;
 		}
 
@@ -1614,15 +1620,22 @@ ConstellationTracker::tryCalibrateDeviceImus()
 		this->sensor_fusion->setDeviceImuCalibration(id, calibration);
 		this->pending_imu_calibrations[id] = calibration;
 		this->device_imus_solved.insert(id);
+		unsolved--;
+		solved_any = true;
 
 		CT_INFO(this, "Solved IMU calibration for device %d", id);
 		this->saveRoomSetupCurrent();
 	}
 
-	if (all_done || now - this->device_imu_phase_start_ns > phase_timeout) {
+	// Finish only once every controller that showed up is solved, or the phase times out. With no controllers
+	// present we keep waiting so the user can turn them on.
+	if ((non_camera_count > 0 && unsolved == 0) || now - this->device_imu_phase_start_ns > phase_timeout) {
 		calib->endCollectingData();
 		this->calibrating_device_imus = false;
-		CT_INFO(this, "Device IMU calibration phase complete");
+		CT_INFO(this,
+		        "Device IMU calibration phase complete%s (non_camera=%zu unsolved=%zu elapsed=%.1fs)",
+		        solved_any ? "" : " (no controllers seen)", non_camera_count, unsolved,
+		        (double)(now - this->device_imu_phase_start_ns) / 1e9);
 	}
 }
 
@@ -1693,6 +1706,28 @@ ConstellationTracker::addDevice(t_constellation_tracker_device_params *params, t
 	if (it != this->pending_imu_calibrations.end()) {
 		this->sensor_fusion->setDeviceImuCalibration(id, it->second);
 		CT_INFO(this, "Applied saved IMU calibration for device %d", id);
+	}
+
+	/*
+	 * The cameras are already solved (loaded from disk or solved this session) but we are missing controller
+	 * IMU calibrations. Start the second phase early so the UI can prompt the user to turn the controllers
+	 * on; it stays open up to the phase timeout and picks controllers up as they connect.
+	 */
+	const bool missing_controller_calibrations = this->pending_imu_calibrations.size() <= 1;
+	if (!this->needSensorCalibration() && !this->calibrating_device_imus &&
+	    (it == this->pending_imu_calibrations.end() || missing_controller_calibrations)) {
+		if (this->camera_calibration_device_id == XRT_CONSTELLATION_INVALID_DEVICE_ID &&
+		    !this->devices.empty()) {
+			this->camera_calibration_device_id = this->devices.front()->id;
+		}
+		for (auto &dev : this->devices) {
+			dev->enabled.store(true);
+		}
+		this->offline_sensor_calibration->beginCollectingData();
+		this->device_imu_phase_start_ns = os_monotonic_get_ns();
+		this->device_imu_last_attempt.clear();
+		this->calibrating_device_imus = true;
+		CT_INFO(this, "Waiting for controllers to calibrate their IMUs against the known cameras");
 	}
 
 	return id;

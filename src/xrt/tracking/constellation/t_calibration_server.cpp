@@ -93,8 +93,33 @@ static std::string buildStatus(ConstellationTracker *tracker, std::string &out_s
 		snprintf(status, sizeof(status), "Waiting to collect %zu samples per camera", expected);
 	} else if (valid) {
 		if (tracker->calibrating_device_imus) {
-			snprintf(status, sizeof(status),
-			         "Calibrating controllers: move both controllers in front of the cameras");
+			char ctrls[160] = "";
+			{
+				std::shared_lock devices_lock(tracker->device_lock);
+				size_t shown = 0;
+				for (auto &device : tracker->devices) {
+					if (device->id == tracker->camera_calibration_device_id ||
+					    tracker->device_imus_solved.count(device->id) != 0) {
+						continue;
+					}
+					size_t n = tracker->offline_sensor_calibration
+					               ? tracker->offline_sensor_calibration->numCameraSamplesForDevice(
+					                     device->id)
+					               : 0;
+					char tmp[48];
+					snprintf(tmp, sizeof(tmp), "%sdevice %d: %zu samples",
+					         shown > 0 ? ", " : "", device->id, n);
+					strncat(ctrls, tmp, sizeof(ctrls) - strlen(ctrls) - 1);
+					shown++;
+				}
+			}
+			if (ctrls[0] != '\0') {
+				snprintf(status, sizeof(status),
+				         "Turn on both controllers and move them in front of the cameras (%s)", ctrls);
+			} else {
+				snprintf(status, sizeof(status),
+				         "Turn on both controllers and move them in front of the cameras");
+			}
 		} else {
 			snprintf(status, sizeof(status), "Tracking (%zu cameras calibrated)", num_cameras);
 		}
