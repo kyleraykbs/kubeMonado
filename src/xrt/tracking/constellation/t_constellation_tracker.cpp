@@ -43,9 +43,9 @@ DEBUG_GET_ONCE_OPTION(constellation_tracker_room_setup_file, "CONSTELLATION_TRAC
 //! Resolve blob ownership across all devices at once instead of device-by-device (better under occlusion).
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_joint_match, "CONSTELLATION_JOINT_MATCH", true)
 //! Reject a per-camera solve whose RMS reprojection error exceeds this many pixels.
-DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_reprojection_px, "CONSTELLATION_MAX_REPROJECTION_PX", 10.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_reprojection_px, "CONSTELLATION_MAX_REPROJECTION_PX", 2.5f)
 //! Largest world-space jump (metres) a device pose may make between samples before it is rejected.
-DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_jump_m, "CONSTELLATION_MAX_JUMP_M", 2.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_jump_m, "CONSTELLATION_MAX_JUMP_M", 0.6f)
 
 // Unconditionally present to allow warning that the feature is not enabled.
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_enable_rerun, "CONSTELLATION_TRACKER_RERUN_ENABLE", false)
@@ -587,14 +587,13 @@ Camera::tryDeviceBlobRecovery(Device *device,
 	 *       assessment, this shouldn't cause many problems.
 	 */
 	/*
-	 * Keep trusting RANSAC here: a valid solve without a prior (the camera-calibration phase, or a device just
-	 * re-acquiring) frequently does not set POSE_MATCH_GOOD, and gating on it made calibration collect nothing.
-	 * Degenerate solves are now rejected by the physical pose_is_plausible gate in pushPose instead, which is
-	 * the check that actually matters.
+	 * Only trust a RANSAC blob-recovery solve when a POSE_MATCH_GOOD was set, except during calibration
+	 * where no prior exists and gating on it made calibration collect nothing. Blanket-trusting RANSAC let
+	 * degenerate/flipped solves through everywhere, which is a big source of controller swaps and jumps.
 	 */
-	constexpr bool kAlwaysTrustRansac = true;
+	bool calibrating = tracker->needSensorCalibration();
 
-	if (kAlwaysTrustRansac || POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
+	if (calibrating || POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
 		CT_DEBUG(tracker, "Camera %p RANSAC-PnP recovered pose was good enough for device %d from %u blobs",
 		         (void *)this, device->id, sample.blob_count);
 
@@ -1091,8 +1090,14 @@ pose_is_plausible(Device *device,
                   const char **reason = nullptr)
 {
 	// Not enough LEDs matched: the solve is under-constrained and any RANSAC result is a guess.
-	if (score.matched_blobs < 4) {
-		if (reason) *reason = "matched_blobs<4";
+	if (score.matched_blobs < 5) {
+		if (reason) *reason = "matched_blobs<5";
+		return false;
+	}
+
+	// A correct solve explains most of the LEDs the model says are visible; a wrong match does not.
+	if (score.visible_leds > 0 && score.matched_blobs < (uint32_t)(0.6f * (float)score.visible_leds)) {
+		if (reason) *reason = "few_matched";
 		return false;
 	}
 
@@ -1139,13 +1144,13 @@ pose_is_plausible(Device *device,
 			const DeviceLastPose &last = device->locked_data.last_known_pose.value();
 
 			/*
-			 * Velocity-scaled continuity gate. A fixed distance/short-window cliff both rejects genuine
-			 * fast re-acquisition and lets swaps between two nearby controllers through. Allow ~8 m/s
-			 * plus a small margin, growing with the gap since the last pose, capped for sanity.
+			 * Continuity gate against the device's last accepted pose. Measured tight (0.05 + 5*dt,
+			 * capped); a solve past this is not accepted just because time passed -- re-acquisition has to
+			 * come with stronger evidence (more blobs / multiple cameras), not a widening gate.
 			 */
 			if (now_ns > last.timestamp_ns) {
 				double dt_s = (double)(now_ns - last.timestamp_ns) * 1e-9;
-				float allowed = 0.1f + 8.0f * (float)dt_s;
+				float allowed = 0.05f + 5.0f * (float)dt_s;
 				if (allowed > max_jump_m) {
 					allowed = max_jump_m;
 				}
