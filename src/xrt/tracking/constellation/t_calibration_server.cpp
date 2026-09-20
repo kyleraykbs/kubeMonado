@@ -309,7 +309,7 @@ static void serverThreadFunc(CalibrationServer *server) {
 				pfds.push_back(pfd);
 			}
 		}
-		int poll_ms = server->tracker->ml_override_enabled.load() ? 4 : 200;
+		int poll_ms = server->tracker->ml_override_enabled.load() ? 4 : 15;
 		int ret = poll(pfds.data(), pfds.size(), poll_ms);
 		if (ret < 0) {
 			if (errno == EINTR) continue;
@@ -370,7 +370,7 @@ static void serverThreadFunc(CalibrationServer *server) {
 		{
 			static auto last_broadcast = std::chrono::steady_clock::now();
 			auto now = std::chrono::steady_clock::now();
-			if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_broadcast).count() > 500) {
+			if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_broadcast).count() > 16) {
 				last_broadcast = now;
 				std::string status;
 				std::string block = buildStatus(server->tracker, status);
