@@ -82,6 +82,7 @@ touch_controller_pose_filter_apply(struct rift_touch_controller *controller,
 		controller->pose_filter.prev_ori = world_pose->orientation;
 		controller->pose_filter.vel = (struct xrt_vec3){0.0f, 0.0f, 0.0f};
 		controller->pose_filter.ang_vel = (struct xrt_vec3){0.0f, 0.0f, 0.0f};
+		controller->pose_filter.reject_streak = 0;
 		os_mutex_unlock(&controller->input.mutex);
 		return;
 	}
@@ -114,6 +115,23 @@ touch_controller_pose_filter_apply(struct rift_touch_controller *controller,
 
 	float gate = 0.03f + 4.0f * (float)dt;
 	if (m_vec3_len(err) > gate) {
+		/*
+		 * Outlier. Hold the prediction and decay velocity, but not forever: if we keep rejecting, the
+		 * estimate can sit far from the (correct) measurement so every new solve is rejected too and the
+		 * controller locks out. After a few consecutive misses, trust the measurement and re-acquire.
+		 */
+		if (++controller->pose_filter.reject_streak >= 3) {
+			controller->pose_filter.pos = world_pose->position;
+			controller->pose_filter.ori = world_pose->orientation;
+			controller->pose_filter.prev_ori = world_pose->orientation;
+			controller->pose_filter.prev_ts_ns = ts;
+			controller->pose_filter.vel = (struct xrt_vec3){0.0f, 0.0f, 0.0f};
+			controller->pose_filter.ang_vel = (struct xrt_vec3){0.0f, 0.0f, 0.0f};
+			controller->pose_filter.ts_ns = ts;
+			controller->pose_filter.reject_streak = 0;
+			os_mutex_unlock(&controller->input.mutex);
+			return;
+		}
 		// Outlier: hold the prediction and decay velocity rather than jump to it.
 		controller->pose_filter.pos = pred;
 		controller->pose_filter.vel = m_vec3_mul_scalar(controller->pose_filter.vel, 0.9f);
@@ -121,6 +139,7 @@ touch_controller_pose_filter_apply(struct rift_touch_controller *controller,
 		os_mutex_unlock(&controller->input.mutex);
 		return;
 	}
+	controller->pose_filter.reject_streak = 0;
 
 	struct xrt_vec3 new_pos = m_vec3_add(pred, m_vec3_mul_scalar(err, w));
 	struct xrt_vec3 inst_vel =

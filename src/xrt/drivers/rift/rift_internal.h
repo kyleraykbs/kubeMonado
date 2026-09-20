@@ -804,6 +804,9 @@ struct rift_touch_controller
 		timepoint_ns prev_ts_ns;
 		struct xrt_vec3 ang_vel;
 
+		//! Consecutive outlier rejections; after a few, trust the next measurement and re-acquire.
+		uint32_t reject_streak;
+
 		//! Accumulator for grouping the per-camera solves of one exposure into one measurement.
 		bool acc_active;
 		timepoint_ns acc_ts_ns;
