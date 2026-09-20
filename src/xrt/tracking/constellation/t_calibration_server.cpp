@@ -92,7 +92,12 @@ static std::string buildStatus(ConstellationTracker *tracker, std::string &out_s
 	} else if (!valid && !is_calibrating) {
 		snprintf(status, sizeof(status), "Waiting to collect %zu samples per camera", expected);
 	} else if (valid) {
-		snprintf(status, sizeof(status), "Tracking (%zu cameras calibrated)", num_cameras);
+		if (tracker->calibrating_device_imus) {
+			snprintf(status, sizeof(status),
+			         "Calibrating controllers: move both controllers in front of the cameras");
+		} else {
+			snprintf(status, sizeof(status), "Tracking (%zu cameras calibrated)", num_cameras);
+		}
 	}
 	int progress = expected > 0 ? (int)(samples * 100 / expected) : 0;
 	if (progress > 100) progress = 100;

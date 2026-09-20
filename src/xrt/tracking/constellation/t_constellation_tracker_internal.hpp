@@ -37,6 +37,7 @@
 #include <fstream>
 #include <string>
 #include <map>
+#include <set>
 
 #include "correspondence_search.h"
 #include "led_search_model.h"
@@ -472,6 +473,13 @@ public: // Fields
 	std::string room_setup_file;
 	std::map<t_constellation_device_id_t, sensor_fusion::DeviceImuCalibration> pending_imu_calibrations;
 
+	//! Second calibration phase: solve each remaining device's IMU against the already-solved cameras.
+	bool calibrating_device_imus{false};
+	t_constellation_device_id_t camera_calibration_device_id{XRT_CONSTELLATION_INVALID_DEVICE_ID};
+	std::set<t_constellation_device_id_t> device_imus_solved;
+	std::map<t_constellation_device_id_t, size_t> device_imu_last_attempt;
+	timepoint_ns device_imu_phase_start_ns{0};
+
 	CalibrationServer *calibration_server{nullptr};
 
 	uint32_t calibration_expected_per_camera{300};
@@ -538,6 +546,10 @@ public: // Methods
 	//! Creates a fresh offline calibration job and registers every camera with it.
 	void
 	setupOfflineSensorCalibration();
+
+	//! Attempts to solve the IMU model of every device that has yet to be calibrated in the second phase.
+	void
+	tryCalibrateDeviceImus();
 
 	bool
 	recenter(float eye_height);

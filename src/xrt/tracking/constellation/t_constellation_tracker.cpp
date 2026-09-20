@@ -152,30 +152,41 @@ run_room_calibration_func(void *ptr)
 
 	// The IMU half of the same solve. Without this the fusion seeds every bias at zero and anchors it there,
 	// so it spends every solve rediscovering intrinsics that were just measured over the whole capture.
-	if (tracker) {
-		tracker->sensor_fusion->setDeviceImuCalibration(result.device_id,
-		                                                sensor_fusion::DeviceImuCalibration{
-		                                                    .accel_bias = result.imu.accel_bias,
-		                                                    .gyro_bias = result.imu.gyro_bias,
-		                                                    .accel_scale = result.imu.accel_scale,
-		                                                    .Qcv_imu_model = result.imu.Qcv_imu_model,
-		                                                });
-	}
+	sensor_fusion::DeviceImuCalibration calibration = {
+	    .accel_bias = result.imu.accel_bias,
+	    .gyro_bias = result.imu.gyro_bias,
+	    .accel_scale = result.imu.accel_scale,
+	    .Qcv_imu_model = result.imu.Qcv_imu_model,
+	};
+	tracker->sensor_fusion->setDeviceImuCalibration(result.device_id, calibration);
+	tracker->pending_imu_calibrations[result.device_id] = calibration;
 
 	{
 		std::unique_lock<os::Mutex> lock(tracker->offline_sensor_calibration_lock);
 		tracker->running_calibration = false;
 	}
 
-	tracker->saveRoomSetup(result);
+	// Hold the solved cameras fixed for the per-device solves that follow.
+	calib->updateCameraPoses(result);
 
+	tracker->camera_calibration_device_id = result.device_id;
+	tracker->saveRoomSetupCurrent();
+
+	/*
+	 * Second phase: the cameras are solved, so now calibrate the remaining devices' IMU models (the Touch
+	 * controllers). The controllers are enabled and their samples accumulated; checkSensorCalibration()
+	 * solves each one as enough data comes in. Without this they keep the identity IMU model, which the
+	 * fusion cannot reconcile and which leaves them offset/drifting.
+	 */
 	{
 		std::shared_lock devices_lock(tracker->device_lock);
 		for (auto &device : tracker->devices) {
-			// Re-enable all devices now that setup is done.
 			device->enabled.store(true);
 		}
 	}
+	calib->beginCollectingData();
+	tracker->device_imu_phase_start_ns = os_monotonic_get_ns();
+	tracker->calibrating_device_imus = true;
 
 	return nullptr;
 }
@@ -1476,6 +1487,13 @@ ConstellationTracker::needSensorCalibration()
 bool
 ConstellationTracker::checkSensorCalibration()
 {
+	// Second phase: cameras are solved, solve each remaining device's IMU against them. Must not hold the
+	// calibration lock while optimize() runs, so it is handled before taking the lock.
+	if (!this->needSensorCalibration() && this->calibrating_device_imus) {
+		this->tryCalibrateDeviceImus();
+		return true;
+	}
+
 	std::unique_lock<os::Mutex> lock(this->offline_sensor_calibration_lock);
 
 	if (this->running_calibration) {
@@ -1535,6 +1553,77 @@ ConstellationTracker::checkSensorCalibration()
 	os_thread_helper_start(&this->offline_sensor_calibration_thread, run_room_calibration_func, this);
 
 	return true;
+}
+
+void
+ConstellationTracker::tryCalibrateDeviceImus()
+{
+	auto &calib = this->offline_sensor_calibration;
+	if (calib == nullptr) {
+		this->calibrating_device_imus = false;
+		return;
+	}
+
+	// Don't collect forever if a device never shows up.
+	const timepoint_ns now = os_monotonic_get_ns();
+	const timepoint_ns phase_timeout = 180 * U_TIME_1S_IN_NS;
+
+	std::vector<t_constellation_device_id_t> ids;
+	{
+		std::shared_lock devices_lock(this->device_lock);
+		for (auto &device : this->devices) {
+			ids.push_back(device->id);
+		}
+	}
+
+	const size_t min_samples = 300;
+	bool all_done = true;
+
+	for (t_constellation_device_id_t id : ids) {
+		if (id == this->camera_calibration_device_id || this->device_imus_solved.count(id) != 0) {
+			continue;
+		}
+
+		size_t n = calib->numCameraSamplesForDevice(id);
+		if (n < min_samples) {
+			all_done = false;
+			continue;
+		}
+
+		// Space out attempts so a failing solve isn't retried on every single sample.
+		size_t last = this->device_imu_last_attempt[id];
+		if (last != 0 && n < last + min_samples) {
+			all_done = false;
+			continue;
+		}
+		this->device_imu_last_attempt[id] = n;
+
+		offline_sensor_calibration::CalibrationResult result;
+		if (!calib->optimize(result, id)) {
+			CT_WARN(this, "IMU calibration for device %d failed, retrying with more samples", id);
+			all_done = false;
+			continue;
+		}
+
+		sensor_fusion::DeviceImuCalibration calibration = {
+		    .accel_bias = result.imu.accel_bias,
+		    .gyro_bias = result.imu.gyro_bias,
+		    .accel_scale = result.imu.accel_scale,
+		    .Qcv_imu_model = result.imu.Qcv_imu_model,
+		};
+		this->sensor_fusion->setDeviceImuCalibration(id, calibration);
+		this->pending_imu_calibrations[id] = calibration;
+		this->device_imus_solved.insert(id);
+
+		CT_INFO(this, "Solved IMU calibration for device %d", id);
+		this->saveRoomSetupCurrent();
+	}
+
+	if (all_done || now - this->device_imu_phase_start_ns > phase_timeout) {
+		calib->endCollectingData();
+		this->calibrating_device_imus = false;
+		CT_INFO(this, "Device IMU calibration phase complete");
+	}
 }
 
 void
