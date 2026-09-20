@@ -257,6 +257,12 @@ public: // Fields
 	{
 		xrt_pose Txr_origin_cam;
 		bool has_concrete_pose;
+
+		//! ML bridge: latest observations for this camera (world<-cam pose + undistorted pixels).
+		bool ml_has{false};
+		int64_t ml_ts{0};
+		xrt_pose ml_world_cam XRT_POSE_IDENTITY;
+		std::vector<xrt_vec2> ml_uv;
 	} locked_data;
 
 	std::atomic<uint32_t> shallow_searches_failed{0};
@@ -401,6 +407,11 @@ public: // Fields
 	struct
 	{
 		std::optional<DeviceLastPose> last_known_pose;
+
+		//! ML bridge override pose (tracking-origin space). Used when the tracker is in ML mode.
+		bool ml_has{false};
+		int64_t ml_ts{0};
+		xrt_space_relation ml_relation{};
 	} locked_data;
 	// clang-format on
 
@@ -491,6 +502,11 @@ public: // Fields
 	timepoint_ns device_imu_phase_start_ns{0};
 
 	CalibrationServer *calibration_server{nullptr};
+
+	//! ML bridge: when enabled, getTrackedPose returns the externally-injected pose for each device.
+	std::atomic<bool> ml_override_enabled{false};
+	//! The world-space anchor used by the ML bridge (camera 0's origin), so the model's frame is fixed.
+	std::optional<xrt_pose> ml_anchor{std::nullopt};
 
 	uint32_t calibration_expected_per_camera{300};
 

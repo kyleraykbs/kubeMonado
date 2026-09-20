@@ -168,6 +168,62 @@ static std::string buildStatus(ConstellationTracker *tracker, std::string &out_s
 	out += "END\n";
 	return out;
 }
+static std::string buildMlBlock(ConstellationTracker *tracker) {
+	std::string out;
+	char line[512];
+	int64_t now = os_monotonic_get_ns();
+	snprintf(line, sizeof(line), "FRAME %" PRIi64 "\n", now);
+	out += line;
+
+	// Cameras: world pose (OpenXR) + pinhole intrinsics + undistorted observations.
+	for (auto &mosaic : tracker->mosaics) {
+		for (auto &camera : mosaic->cameras) {
+			std::unique_lock<os::Mutex> lk(camera->processing_lock);
+			auto &d = camera->locked_data;
+			auto &m = camera->model.calib_pinhole;
+			snprintf(line, sizeof(line),
+			         "CAM %zu %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.4f %.4f %.4f %.4f %zu\n",
+			         camera->index, d.ml_has ? 1 : 0, d.ml_world_cam.position.x, d.ml_world_cam.position.y,
+			         d.ml_world_cam.position.z, d.ml_world_cam.orientation.x, d.ml_world_cam.orientation.y,
+			         d.ml_world_cam.orientation.z, d.ml_world_cam.orientation.w, m.fx, m.fy, m.cx, m.cy,
+			         d.ml_uv.size());
+			out += line;
+			for (auto &uv : d.ml_uv) {
+				snprintf(line, sizeof(line), "OBS %zu %.4f %.4f\n", camera->index, uv.x, uv.y);
+				out += line;
+			}
+		}
+	}
+
+	// Devices: LED model (unflipped back to the raw/sim frame), prior world pose from the IMU source.
+	{
+		std::shared_lock dlk(tracker->device_lock);
+		for (auto &device : tracker->devices) {
+			auto &lm = device->params.led_model;
+			snprintf(line, sizeof(line), "LED %d %u\n", device->id, (unsigned)lm.led_count);
+			out += line;
+			for (uint16_t i = 0; i < lm.led_count; i++) {
+				auto &led = lm.leds[i];
+				snprintf(line, sizeof(line), "L %d %.6f %.6f %.6f %.6f %.6f %.6f\n", device->id, led.position.x,
+				         -led.position.y, -led.position.z, led.normal.x, -led.normal.y, -led.normal.z);
+				out += line;
+			}
+			xrt_space_relation pred = XRT_SPACE_RELATION_ZERO;
+			if (device->params.tracking_source != nullptr) {
+				t_constellation_tracker_tracking_source_get_tracked_pose(device->params.tracking_source, now, &pred);
+			}
+			bool valid = (pred.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0;
+			snprintf(line, sizeof(line), "DEV %d %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n", device->id,
+			         valid ? 1 : 0, pred.pose.position.x, pred.pose.position.y, pred.pose.position.z,
+			         pred.pose.orientation.x, pred.pose.orientation.y, pred.pose.orientation.z,
+			         pred.pose.orientation.w);
+			out += line;
+		}
+	}
+	out += "ENDML\n";
+	return out;
+}
+
 static void handleCommand(CalibrationServer *server, const char *line) {
 	ConstellationTracker *tracker = server->tracker;
 	if (strcmp(line, "START") == 0) {
@@ -210,6 +266,31 @@ static void handleCommand(CalibrationServer *server, const char *line) {
 				}
 			}
 		}
+	} else if (strncmp(line, "MODE", 4) == 0) {
+		const char *m = line + 4;
+		while (*m == ' ') {
+			m++;
+		}
+		bool on = strncmp(m, "ml", 2) == 0;
+		tracker->ml_override_enabled.store(on);
+		CT_INFO(tracker, "ML override mode: %s", on ? "on" : "off");
+	} else if (strncmp(line, "MLPOSE ", 7) == 0) {
+		int id = -1;
+		xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+		if (sscanf(line + 7, "%d %f %f %f %f %f %f %f", &id, &rel.pose.position.x, &rel.pose.position.y,
+		           &rel.pose.position.z, &rel.pose.orientation.x, &rel.pose.orientation.y,
+		           &rel.pose.orientation.z, &rel.pose.orientation.w) == 8) {
+			std::shared_lock dlk(tracker->device_lock);
+			for (auto &device : tracker->devices) {
+				if (device->id == (t_constellation_device_id_t)id) {
+					std::unique_lock<os::Mutex> lk(device->data_lock);
+					device->locked_data.ml_relation = rel;
+					device->locked_data.ml_has = true;
+					device->locked_data.ml_ts = os_monotonic_get_ns();
+					break;
+				}
+			}
+		}
 	}
 }
 static void serverThreadFunc(CalibrationServer *server) {
@@ -228,7 +309,8 @@ static void serverThreadFunc(CalibrationServer *server) {
 				pfds.push_back(pfd);
 			}
 		}
-		int ret = poll(pfds.data(), pfds.size(), 200);
+		int poll_ms = server->tracker->ml_override_enabled.load() ? 4 : 200;
+		int ret = poll(pfds.data(), pfds.size(), poll_ms);
 		if (ret < 0) {
 			if (errno == EINTR) continue;
 			break;
@@ -295,6 +377,12 @@ static void serverThreadFunc(CalibrationServer *server) {
 				for (auto &c : server->clients) {
 					if (c.fd >= 0) send(c.fd, block.c_str(), block.size(), SEND_FLAGS);
 				}
+			}
+		}
+		if (server->tracker->ml_override_enabled.load()) {
+			std::string block = buildMlBlock(server->tracker);
+			for (auto &c : server->clients) {
+				if (c.fd >= 0) send(c.fd, block.c_str(), block.size(), SEND_FLAGS);
 			}
 		}
 	}

@@ -2018,6 +2018,20 @@ ConstellationTracker::getTrackedPose(t_constellation_device_id_t device_id,
 			continue;
 		}
 
+		// ML bridge override: if an external process is driving this device, use its pose (falling back
+		// to the fusion if the bridge has gone stale so a dead process can't freeze tracking).
+		if (this->ml_override_enabled.load()) {
+			std::unique_lock<os::Mutex> dlk(device->data_lock);
+			if (device->locked_data.ml_has && when_ns >= device->locked_data.ml_ts &&
+			    (when_ns - device->locked_data.ml_ts) < (timepoint_ns)(100 * U_TIME_1MS_IN_NS)) {
+				out_relation = device->locked_data.ml_relation;
+				out_relation.relation_flags = static_cast<xrt_space_relation_flags>(
+				    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+				    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
+				return;
+			}
+		}
+
 		timepoint_ns pose_ts = 0;
 		xrt_space_relation relation;
 		this->sensor_fusion->getTrackedPose(device_id, when_ns, pose_ts, relation);
@@ -2265,6 +2279,23 @@ constellation_tracker_camera_push_blobs(t_blob_sink *tbs, t_blob_observation *tb
 	ConstellationTracker *tracker = camera->tracker;
 
 	CT_TRACE(tracker, "Received blob observation at %" PRIi64 " with %u blobs", tbo->timestamp_ns, tbo->num_blobs);
+
+	if (tracker->ml_override_enabled.load()) {
+		// ML bridge: keep the latest world-space observation set for this camera so an external process
+		// can run the learned model on it.
+		auto wp = camera->getWorldPose(tbo->timestamp_ns);
+		std::unique_lock<os::Mutex> lk(camera->processing_lock);
+		camera->locked_data.ml_ts = tbo->timestamp_ns;
+		camera->locked_data.ml_has = wp.has_value();
+		if (wp.has_value()) {
+			camera->locked_data.ml_world_cam = wp.value();
+		}
+		camera->locked_data.ml_uv.clear();
+		camera->locked_data.ml_uv.reserve(tbo->num_blobs);
+		for (uint32_t i = 0; i < tbo->num_blobs; i++) {
+			camera->locked_data.ml_uv.push_back(tbo->blobs[i].center_undistorted);
+		}
+	}
 
 	if (tbo->num_blobs == 0) {
 		// Push this empty sample into the sensor fusion algorithm so that it's aware of this exposure keyframe.
