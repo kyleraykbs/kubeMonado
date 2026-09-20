@@ -60,7 +60,11 @@ DEBUG_GET_ONCE_BOOL_OPTION(offline_sensor_calibration_rerun_spawn, "T_OFFLINE_SE
  * This doesn't actually correct the problem long-term, but it's a *very* useful debugging tool to have in our toolbelt.
  */
 DEBUG_GET_ONCE_NUM_OPTION(offline_sensor_calibration_time_offset_ns, "T_OFFLINE_SENSOR_CALIBRATION_TIME_OFFSET_NS", 0)
-DEBUG_GET_ONCE_NUM_OPTION(offline_sensor_calibration_sweep_range_ns, "T_OFFLINE_SENSOR_CALIBRATION_SWEEP_RANGE_NS", 0)
+// The Rift sensor frame timestamps sit on the exposure clock but can carry a fixed residual offset; sweeping
+// it stops that offset from being absorbed into a distorted camera geometry.
+DEBUG_GET_ONCE_NUM_OPTION(offline_sensor_calibration_sweep_range_ns,
+                          "T_OFFLINE_SENSOR_CALIBRATION_SWEEP_RANGE_NS",
+                          4 * 1000 * 1000)
 DEBUG_GET_ONCE_NUM_OPTION(offline_sensor_calibration_sweep_step_ns,
                           "T_OFFLINE_SENSOR_CALIBRATION_SWEEP_STEP_NS",
                           1000 * 1000)
