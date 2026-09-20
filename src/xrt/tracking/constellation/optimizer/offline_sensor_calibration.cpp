@@ -1228,6 +1228,7 @@ OfflineSensorCalibration::pushCameraSample(ConstellationTracker *tracker, const 
 	std::unique_lock<os::Mutex> lock(this->lock);
 
 	if (!this->collecting_data) {
+		RS_DEBUG(this, "pushCameraSample: not collecting, ignoring sample");
 		return;
 	}
 
@@ -1239,6 +1240,7 @@ OfflineSensorCalibration::pushCameraSample(ConstellationTracker *tracker, const 
 		}
 
 		const auto device_id = device_state.device_id;
+		RS_DEBUG(this, "pushCameraSample: device %d has found_pose", device_id);
 		const auto &found_pose = device_state.found_pose.value();
 		const auto device_iter =
 		    std::find_if(tracker->devices.begin(), tracker->devices.end(),
@@ -1287,9 +1289,12 @@ OfflineSensorCalibration::pushCameraSample(ConstellationTracker *tracker, const 
 		 * re-matched to the final pose afterwards, so an observation can still end up short of it here.
 		 */
 		if (points2d.size() < kMinCorrespondencesPerObservation) {
+			RS_DEBUG(this, "pushCameraSample: device %d dropped, only %zu points (< %zu)",
+			         device_id, points2d.size(), kMinCorrespondencesPerObservation);
 			continue;
 		}
 
+		const size_t recorded_points = points2d.size();
 		DeviceCameraSample device_sample = {
 		    .mosaic_idx = sample.mosaic_index,
 		    .camera_idx = sample.camera_index,
@@ -1303,6 +1308,8 @@ OfflineSensorCalibration::pushCameraSample(ConstellationTracker *tracker, const 
 		};
 
 		auto &device_samples = this->getDeviceSamplesLocked(device_id);
+		RS_DEBUG(this, "pushCameraSample: recorded %zu points for device %d (total %zu)", recorded_points, device_id,
+		         device_samples.camera_samples.size() + 1);
 		device_samples.camera_samples.push_back(std::move(device_sample));
 	}
 }

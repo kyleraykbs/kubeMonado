@@ -1082,10 +1082,12 @@ pose_is_plausible(Device *device,
                   const pose_metrics &score,
                   timepoint_ns now_ns,
                   float max_reprojection_px,
-                  float max_jump_m)
+                  float max_jump_m,
+                  const char **reason = nullptr)
 {
 	// Not enough LEDs matched: the solve is under-constrained and any RANSAC result is a guess.
 	if (score.matched_blobs < 4) {
+		if (reason) *reason = "matched_blobs<4";
 		return false;
 	}
 
@@ -1093,17 +1095,26 @@ pose_is_plausible(Device *device,
 	if (!std::isfinite(p.position.x) || !std::isfinite(p.position.y) || !std::isfinite(p.position.z) ||
 	    !std::isfinite(p.orientation.x) || !std::isfinite(p.orientation.y) ||
 	    !std::isfinite(p.orientation.z) || !std::isfinite(p.orientation.w)) {
+		if (reason) *reason = "non-finite";
 		return false;
 	}
 
-	// The device must be in front of the camera and not implausibly far away.
-	if (p.position.z < 0.1f || p.position.z > 10.0f) {
+	/*
+	 * The device must be in front of the camera and not implausibly far away. `Txr_cam_device` is already in
+	 * OpenXR camera space, which looks down -Z (OpenCV is +Z forward, and math_pose_convert_from_opencv flips
+	 * the sign of Z), so depth is -Z here. Checking +Z rejected every in-front device, which made the tracker
+	 * publish no poses at all and camera calibration collect zero samples.
+	 */
+	const float depth_m = -p.position.z;
+	if (depth_m < 0.1f || depth_m > 10.0f) {
+		if (reason) *reason = "depth";
 		return false;
 	}
 
 	if (score.matched_blobs > 0 && score.reprojection_error > 0.0) {
 		float rms = sqrtf((float)score.reprojection_error / (float)score.matched_blobs);
 		if (rms > max_reprojection_px) {
+			if (reason) *reason = "reprojection";
 			return false;
 		}
 	}
@@ -1114,6 +1125,7 @@ pose_is_plausible(Device *device,
 		math_pose_transform(&Txr_world_cam.value(), &Txr_cam_device, &Txr_world_device);
 
 		if (m_vec3_len(Txr_world_device.position) > 10.0f) {
+			if (reason) *reason = "world_far";
 			return false;
 		}
 
@@ -1128,6 +1140,7 @@ pose_is_plausible(Device *device,
 			if (last_is_recent &&
 			    m_vec3_len(m_vec3_sub(Txr_world_device.position, last.Txr_world_device.position)) >
 			        max_jump_m) {
+				if (reason) *reason = "jump";
 				return false;
 			}
 		}
@@ -1231,10 +1244,11 @@ Camera::pushPose(CameraSample &camera_sample,
 
 	// Reject implausible solves before they can poison the relation history. The blobs were already marked
 	// above, so drop them again here or they'd be treated as trusted correspondences for this device.
+	const char *reject_reason = "?";
 	if (!pose_is_plausible(device, Txr_cam_device, camera_sample.Txr_world_cam, score,
 	                       camera_sample.timestamp_ns,
 	                       debug_get_float_option_constellation_max_reprojection_px(),
-	                       debug_get_float_option_constellation_max_jump_m())) {
+	                       debug_get_float_option_constellation_max_jump_m(), &reject_reason)) {
 		for (uint32_t i = 0; i < camera_sample.blob_count; i++) {
 			t_blob &b = camera_sample.blobs[i];
 			if (b.matched_device_id == device->id) {
@@ -1243,8 +1257,12 @@ Camera::pushPose(CameraSample &camera_sample,
 			}
 		}
 
-		CT_DEBUG(tracker, "Rejected implausible pose for device %d (%u blobs matched)", device->id,
-		         score.matched_blobs);
+		float rej_depth = -Txr_cam_device.position.z;
+		double rej_rms = score.matched_blobs > 0 ? sqrt(score.reprojection_error / score.matched_blobs) : 0.0;
+		CT_DEBUG(tracker,
+		         "Rejected implausible pose for device %d (%u blobs): %s (OpenXR pos %.3f,%.3f,%.3f depth %.3f rms %.2f)",
+		         device->id, score.matched_blobs, reject_reason, Txr_cam_device.position.x,
+		         Txr_cam_device.position.y, Txr_cam_device.position.z, rej_depth, rej_rms);
 		return false;
 	}
 
