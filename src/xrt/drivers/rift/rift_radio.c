@@ -114,22 +114,7 @@ touch_controller_constellation_tracking_source_get_tracked_pose(
 
 	*out_relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
 
-	/*
-	 * Prefer the same IMU-fused constellation pose the HMD uses as its prior. The raw per-camera
-	 * history is noisy and jumps whenever the set of cameras seeing the controller changes, which
-	 * gives the tracker a bad prior and is what makes the controllers glitchy and swap.
-	 */
-	if (controller->use_constellation && controller->constellation_tracker != NULL) {
-		if (t_constellation_tracker_get_tracked_pose(controller->constellation_tracker,
-		                                             controller->constellation_device_id, when_ns,
-		                                             out_relation) < 0) {
-			*out_relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
-		}
-	}
-
-	if (out_relation->relation_flags == 0) {
-		m_relation_history_get(controller->constellation_relation_history, when_ns, out_relation);
-	}
+	m_relation_history_get(controller->constellation_relation_history, when_ns, out_relation);
 }
 
 static void
