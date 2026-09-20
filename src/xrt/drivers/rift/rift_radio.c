@@ -59,18 +59,17 @@ touch_quat_conj(struct xrt_quat q)
 }
 
 /*!
- * Feed one per-camera world solve into the controller's own estimator.
+ * Apply one combined measurement (all cameras of one exposure) to the controller's estimator.
  *
- * This is the pose the debug top-down view shows, so we trust it over the global fusion. Position uses a
- * gated alpha-beta filter; rotation is smoothed and an angular velocity is derived from consecutive
- * vision solves so we can predict between updates.
+ * Position uses a gated alpha-beta filter; rotation is smoothed and an angular velocity is derived from
+ * consecutive vision solves so we can predict between updates.
  */
 static void
-touch_controller_pose_filter_update(struct rift_touch_controller *controller,
-                                    const struct xrt_pose *world_pose,
-                                    timepoint_ns ts,
-                                    uint32_t matched,
-                                    float rms)
+touch_controller_pose_filter_apply(struct rift_touch_controller *controller,
+                                   const struct xrt_pose *world_pose,
+                                   timepoint_ns ts,
+                                   uint32_t matched,
+                                   float rms)
 {
 	os_mutex_lock(&controller->input.mutex);
 
@@ -172,12 +171,112 @@ touch_controller_pose_filter_update(struct rift_touch_controller *controller,
 	os_mutex_unlock(&controller->input.mutex);
 }
 
+//! Apply the pending same-exposure accumulator, if any.
+static void
+touch_controller_pose_filter_flush(struct rift_touch_controller *controller)
+{
+	struct xrt_pose combined;
+	timepoint_ns cts = 0;
+	uint32_t cmatched = 0;
+	float crms = 0.0f;
+	bool have = false;
+
+	os_mutex_lock(&controller->input.mutex);
+	if (controller->pose_filter.acc_active && controller->pose_filter.acc_wsum > 0.0f) {
+		combined.position =
+		    m_vec3_mul_scalar(controller->pose_filter.acc_pos_sum, 1.0f / controller->pose_filter.acc_wsum);
+		combined.orientation = controller->pose_filter.acc_ori_best;
+		cts = controller->pose_filter.acc_ts_ns;
+		cmatched = controller->pose_filter.acc_matched;
+		crms = controller->pose_filter.acc_rms;
+		controller->pose_filter.acc_active = false;
+		have = true;
+	}
+	os_mutex_unlock(&controller->input.mutex);
+
+	if (have) {
+		touch_controller_pose_filter_apply(controller, &combined, cts, cmatched, crms);
+	}
+}
+
+/*!
+ * Feed one per-camera world solve into the controller's estimator.
+ *
+ * Solves from all cameras of the same exposure are grouped into a single measurement (this is the pose the
+ * debug top-down view shows, so we trust it over the global fusion), which stops the estimator hopping
+ * between cameras.
+ */
+static void
+touch_controller_pose_filter_update(struct rift_touch_controller *controller,
+                                    const struct xrt_pose *world_pose,
+                                    timepoint_ns ts,
+                                    uint32_t matched,
+                                    float rms)
+{
+	const timepoint_ns kWindowNs = 5 * U_TIME_1MS_IN_NS;
+
+	// New exposure? Flush the previous group first.
+	bool flush = false;
+	os_mutex_lock(&controller->input.mutex);
+	if (controller->pose_filter.acc_active && ts > controller->pose_filter.acc_ts_ns &&
+	    ts - controller->pose_filter.acc_ts_ns > kWindowNs) {
+		flush = true;
+	}
+	os_mutex_unlock(&controller->input.mutex);
+	if (flush) {
+		touch_controller_pose_filter_flush(controller);
+	}
+
+	float q = (float)(matched < 1 ? 1 : matched);
+	if (rms > 5.0f) {
+		q *= 0.5f;
+	}
+
+	os_mutex_lock(&controller->input.mutex);
+	if (!controller->pose_filter.acc_active) {
+		controller->pose_filter.acc_active = true;
+		controller->pose_filter.acc_ts_ns = ts;
+		controller->pose_filter.acc_pos_sum = m_vec3_mul_scalar(world_pose->position, q);
+		controller->pose_filter.acc_wsum = q;
+		controller->pose_filter.acc_ori_best = world_pose->orientation;
+		controller->pose_filter.acc_best_q = q;
+		controller->pose_filter.acc_matched = matched;
+		controller->pose_filter.acc_rms = rms;
+	} else {
+		controller->pose_filter.acc_pos_sum =
+		    m_vec3_add(controller->pose_filter.acc_pos_sum, m_vec3_mul_scalar(world_pose->position, q));
+		controller->pose_filter.acc_wsum += q;
+		if (q > controller->pose_filter.acc_best_q) {
+			controller->pose_filter.acc_ori_best = world_pose->orientation;
+			controller->pose_filter.acc_best_q = q;
+		}
+		if (matched > controller->pose_filter.acc_matched) {
+			controller->pose_filter.acc_matched = matched;
+		}
+		if (rms < controller->pose_filter.acc_rms) {
+			controller->pose_filter.acc_rms = rms;
+		}
+	}
+	os_mutex_unlock(&controller->input.mutex);
+}
+
 //! Predict the controller's own estimate to @p when.
 static bool
 touch_controller_pose_filter_get(struct rift_touch_controller *controller,
                                  timepoint_ns when,
                                  struct xrt_space_relation *out_relation)
 {
+	// Apply any pending exposure group first, so we predict from the freshest estimate (and don't add a
+	// whole frame of latency).
+	bool stale_flush = false;
+	os_mutex_lock(&controller->input.mutex);
+	stale_flush = controller->pose_filter.acc_active && when > controller->pose_filter.acc_ts_ns &&
+	              when - controller->pose_filter.acc_ts_ns > (timepoint_ns)(4 * U_TIME_1MS_IN_NS);
+	os_mutex_unlock(&controller->input.mutex);
+	if (stale_flush) {
+		touch_controller_pose_filter_flush(controller);
+	}
+
 	os_mutex_lock(&controller->input.mutex);
 	if (!controller->pose_filter.has) {
 		os_mutex_unlock(&controller->input.mutex);

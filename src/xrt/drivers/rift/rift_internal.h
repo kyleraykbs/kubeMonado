@@ -803,6 +803,16 @@ struct rift_touch_controller
 		struct xrt_quat prev_ori;
 		timepoint_ns prev_ts_ns;
 		struct xrt_vec3 ang_vel;
+
+		//! Accumulator for grouping the per-camera solves of one exposure into one measurement.
+		bool acc_active;
+		timepoint_ns acc_ts_ns;
+		struct xrt_vec3 acc_pos_sum;
+		float acc_wsum;
+		struct xrt_quat acc_ori_best;
+		float acc_best_q;
+		uint32_t acc_matched;
+		float acc_rms;
 	} pose_filter;
 	bool use_pose_filter;
 
