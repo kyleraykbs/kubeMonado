@@ -11,6 +11,8 @@
 
 #include "math/m_relation_history.h"
 #include "math/m_space.h"
+#include "math/m_api.h"
+#include "math/m_vec3.h"
 
 #include "util/u_device.h"
 #include "util/u_var.h"
@@ -38,6 +40,165 @@ rift_update_input(struct xrt_device *device, size_t index, union xrt_input_value
 //! How stale a constellation sample may be before the fallback freezes instead of extrapolating.
 #define RIFT_TOUCH_FREEZE_NS (150 * U_TIME_1MS_IN_NS)
 
+static struct xrt_quat
+touch_quat_mul(struct xrt_quat a, struct xrt_quat b)
+{
+	struct xrt_quat r;
+	r.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
+	r.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
+	r.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
+	r.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
+	return r;
+}
+
+static struct xrt_quat
+touch_quat_conj(struct xrt_quat q)
+{
+	struct xrt_quat r = {-q.x, -q.y, -q.z, q.w};
+	return r;
+}
+
+/*!
+ * Feed one per-camera world solve into the controller's own estimator.
+ *
+ * This is the pose the debug top-down view shows, so we trust it over the global fusion. Position uses a
+ * gated alpha-beta filter; rotation is smoothed and an angular velocity is derived from consecutive
+ * vision solves so we can predict between updates.
+ */
+static void
+touch_controller_pose_filter_update(struct rift_touch_controller *controller,
+                                    const struct xrt_pose *world_pose,
+                                    timepoint_ns ts,
+                                    uint32_t matched,
+                                    float rms)
+{
+	os_mutex_lock(&controller->input.mutex);
+
+	if (!controller->pose_filter.has) {
+		controller->pose_filter.has = true;
+		controller->pose_filter.ts_ns = ts;
+		controller->pose_filter.prev_ts_ns = ts;
+		controller->pose_filter.pos = world_pose->position;
+		controller->pose_filter.ori = world_pose->orientation;
+		controller->pose_filter.prev_ori = world_pose->orientation;
+		controller->pose_filter.vel = (struct xrt_vec3){0.0f, 0.0f, 0.0f};
+		controller->pose_filter.ang_vel = (struct xrt_vec3){0.0f, 0.0f, 0.0f};
+		os_mutex_unlock(&controller->input.mutex);
+		return;
+	}
+
+	double dt = (double)(ts - controller->pose_filter.ts_ns) * 1e-9;
+	if (dt <= 1e-4) {
+		os_mutex_unlock(&controller->input.mutex);
+		return;
+	}
+
+	// Weight the update by solve quality; sparse/dirty solves move the pose less.
+	float w = 0.4f;
+	if (matched <= 4) {
+		w = 0.2f;
+	} else if (matched >= 8 && rms < 3.0f) {
+		w = 0.6f;
+	}
+
+	struct xrt_vec3 pred =
+	    m_vec3_add(controller->pose_filter.pos, m_vec3_mul_scalar(controller->pose_filter.vel, (float)dt));
+	struct xrt_vec3 err = m_vec3_sub(world_pose->position, pred);
+
+	float gate = 0.05f + 6.0f * (float)dt;
+	if (m_vec3_len(err) > gate) {
+		// Outlier: hold the prediction and decay velocity rather than jump to it.
+		controller->pose_filter.pos = pred;
+		controller->pose_filter.vel = m_vec3_mul_scalar(controller->pose_filter.vel, 0.9f);
+		controller->pose_filter.ts_ns = ts;
+		os_mutex_unlock(&controller->input.mutex);
+		return;
+	}
+
+	struct xrt_vec3 new_pos = m_vec3_add(pred, m_vec3_mul_scalar(err, w));
+	struct xrt_vec3 inst_vel =
+	    m_vec3_mul_scalar(m_vec3_sub(new_pos, controller->pose_filter.pos), 1.0f / (float)dt);
+	controller->pose_filter.vel =
+	    m_vec3_mul_scalar(m_vec3_add(controller->pose_filter.vel, inst_vel), 0.5f);
+	controller->pose_filter.pos = new_pos;
+
+	// Angular velocity from the change in vision orientation, for prediction between updates.
+	struct xrt_quat dq =
+	    touch_quat_mul(world_pose->orientation, touch_quat_conj(controller->pose_filter.prev_ori));
+	double ddt = (double)(ts - controller->pose_filter.prev_ts_ns) * 1e-9;
+	if (ddt > 1e-4) {
+		float qw = dq.w < 0.0f ? -dq.w : dq.w;
+		if (qw > 1.0f) {
+			qw = 1.0f;
+		}
+		float s2 = 1.0f - qw * qw;
+		if (s2 < 0.0f) {
+			s2 = 0.0f;
+		}
+		float s = sqrtf(s2);
+		float angle = 2.0f * acosf(qw);
+		if (s > 1e-4f && angle < 1.5f) {
+			struct xrt_vec3 axis = {dq.x / s, dq.y / s, dq.z / s};
+			controller->pose_filter.ang_vel = m_vec3_mul_scalar(axis, angle / (float)ddt);
+		}
+	}
+	controller->pose_filter.prev_ori = world_pose->orientation;
+	controller->pose_filter.prev_ts_ns = ts;
+
+	math_quat_slerp(&controller->pose_filter.ori, &world_pose->orientation, w, &controller->pose_filter.ori);
+	math_quat_ensure_normalized(&controller->pose_filter.ori);
+	controller->pose_filter.ts_ns = ts;
+
+	os_mutex_unlock(&controller->input.mutex);
+}
+
+//! Predict the controller's own estimate to @p when.
+static bool
+touch_controller_pose_filter_get(struct rift_touch_controller *controller,
+                                 timepoint_ns when,
+                                 struct xrt_space_relation *out_relation)
+{
+	os_mutex_lock(&controller->input.mutex);
+	if (!controller->pose_filter.has) {
+		os_mutex_unlock(&controller->input.mutex);
+		return false;
+	}
+
+	double dt = (double)(when - controller->pose_filter.ts_ns) * 1e-9;
+	if (dt < 0.0) {
+		dt = 0.0;
+	}
+	if (dt > 0.25) {
+		dt = 0.25;
+	}
+
+	struct xrt_vec3 pos =
+	    m_vec3_add(controller->pose_filter.pos, m_vec3_mul_scalar(controller->pose_filter.vel, (float)dt));
+	struct xrt_quat ori = controller->pose_filter.ori;
+	float wmag = m_vec3_len(controller->pose_filter.ang_vel);
+	if (wmag > 1e-3f) {
+		struct xrt_vec3 axis = m_vec3_mul_scalar(controller->pose_filter.ang_vel, 1.0f / wmag);
+		struct xrt_quat dq;
+		math_quat_from_angle_vector(wmag * (float)dt, &axis, &dq);
+		ori = touch_quat_mul(dq, ori);
+	}
+	struct xrt_vec3 vel = controller->pose_filter.vel;
+	struct xrt_vec3 ang_vel = controller->pose_filter.ang_vel;
+	os_mutex_unlock(&controller->input.mutex);
+
+	out_relation->pose.position = pos;
+	out_relation->pose.orientation = ori;
+	out_relation->linear_velocity = vel;
+	out_relation->angular_velocity = ang_vel;
+	out_relation->relation_flags = XRT_SPACE_RELATION_POSITION_VALID_BIT |
+	                               XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+	                               XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+	                               XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+	                               XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT |
+	                               XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+	return true;
+}
+
 static xrt_result_t
 rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
                                        const enum xrt_input_name name,
@@ -52,10 +213,18 @@ rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
 		struct xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
 
 		/*
-		 * Primary: the same fused pose the headset uses. The sensor fusion ingests every camera and the
-		 * device IMU at once, so it is both more accurate and steadier than the raw per-camera history.
+		 * Primary: the controller's own estimator, built from the per-camera world solves (the pose the
+		 * debug top-down view shows) plus a vision-derived angular velocity. It never goes Lost/freezes
+		 * and is decoupled from the global fusion, which handles sparse controller observations badly.
 		 */
-		if (controller->use_constellation) {
+		if (controller->use_pose_filter) {
+			touch_controller_pose_filter_get(controller, at_timestamp_ns, &relation);
+		}
+
+		/*
+		 * Fallback: the same fused pose the headset uses, if the estimator has nothing yet.
+		 */
+		if (relation.relation_flags == 0 && controller->use_constellation) {
 			if (t_constellation_tracker_get_tracked_pose(controller->constellation_tracker,
 			                                             controller->constellation_device_id,
 			                                             at_timestamp_ns, &relation) < 0) {
@@ -459,6 +628,10 @@ touch_controller_constellation_device_push_constellation_tracker_sample(
 	                          XRT_SPACE_RELATION_POSITION_VALID_BIT;
 
 	m_relation_history_push(controller->constellation_relation_history, &relation, sample->timestamp_ns);
+
+	touch_controller_pose_filter_update(controller, &sample->world_pose, sample->timestamp_ns,
+	                                    sample->metrics.matched_blob_count,
+	                                    (float)sample->metrics.reprojection_error);
 }
 
 static struct rift_touch_controller *
@@ -504,6 +677,9 @@ rift_touch_controller_create(struct rift_hmd *hmd,
 	m_relation_history_create(&controller->constellation_relation_history);
 
 	controller->use_constellation = false;
+	const char *pose_filter_env = getenv("RIFT_TOUCH_POSE_FILTER");
+	controller->use_pose_filter = (pose_filter_env == NULL) || (pose_filter_env[0] != '0');
+	controller->pose_filter.has = false;
 	controller->constellation_device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID;
 	controller->constellation_tracking_source.get_tracked_pose =
 	    touch_controller_constellation_tracking_source_get_tracked_pose;

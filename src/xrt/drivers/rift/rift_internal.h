@@ -788,6 +788,24 @@ struct rift_touch_controller
 		} haptic;
 	} input;
 
+	/*
+	 * Per-controller pose estimator, decoupled from the global sensor fusion. Built from the per-camera
+	 * world solves (what the debug top-down view shows) plus a vision-derived angular velocity, so it
+	 * degrades gracefully with sparse observations instead of going Lost/freezing.
+	 */
+	struct
+	{
+		bool has;
+		timepoint_ns ts_ns;
+		struct xrt_vec3 pos;
+		struct xrt_vec3 vel;
+		struct xrt_quat ori;
+		struct xrt_quat prev_ori;
+		timepoint_ns prev_ts_ns;
+		struct xrt_vec3 ang_vel;
+	} pose_filter;
+	bool use_pose_filter;
+
 	//! Locked by radio_state.thread
 	struct
 	{
