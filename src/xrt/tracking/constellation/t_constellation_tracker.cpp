@@ -623,6 +623,8 @@ Camera::assignBlobsGlobally(CameraSample &sample)
 		t_constellation_tracker_led *led;
 		double sq_error;
 		double depth_m;
+		//! True if this (device, LED) is what the blob was labelled as in the previous frame.
+		bool carried;
 	};
 
 	std::vector<Candidate> candidates;
@@ -662,6 +664,8 @@ Camera::assignBlobsGlobally(CameraSample &sample)
 			    .led = led_info.led,
 			    .sq_error = dx * dx + dy * dy,
 			    .depth_m = led_info.pos_m.z,
+			    .carried = (led_info.matched_blob->matched_device_id == device->id &&
+			                led_info.matched_blob->matched_device_led_id == led_info.led->id),
 			});
 		}
 	}
@@ -677,12 +681,14 @@ Camera::assignBlobsGlobally(CameraSample &sample)
 	}
 
 	/*
-	 * Resolve contested blobs by how well they fit each device's *predicted* pose (which is the
-	 * IMU-fused previous pose), not by raw depth. A blob fits the controller that expects it there, so
-	 * this keeps each controller near where it already was and stops the two from trading blobs.
-	 * Depth only breaks near-ties, where the nearer LED is the one actually visible.
+	 * Resolve contested blobs. A blob keeps the (device, LED) it was labelled as in the previous frame --
+	 * the blobwatch tracks blob identities across frames, so this is real temporal correspondence -- unless
+	 * nothing carries over. After that, fit the predicted pose, with depth only breaking near-ties.
 	 */
 	std::sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b) {
+		if (a.carried != b.carried) {
+			return a.carried;
+		}
 		if (std::abs(a.sq_error - b.sq_error) > 2.0) {
 			return a.sq_error < b.sq_error;
 		}
