@@ -75,7 +75,21 @@ rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
 			                                  &latest)) {
 				int64_t age_ns = at_timestamp_ns > latest_ns ? at_timestamp_ns - latest_ns : 0;
 				if (age_ns > RIFT_TOUCH_FREEZE_NS) {
+					/*
+					 * Hold the last known position (don't extrapolate it with a stale velocity) but keep
+					 * the orientation live from the IMU, so a controller that briefly loses the cameras
+					 * still rotates naturally instead of snapping/freezing rigidly.
+					 */
 					relation = latest;
+					struct xrt_quat q = XRT_QUAT_IDENTITY;
+					struct xrt_vec3 av = XRT_VEC3_ZERO;
+					if (imu_fusion_get_prediction(controller->input.imu_fusion,
+					                              (uint64_t)at_timestamp_ns, &q, &av) == 0) {
+						relation.pose.orientation = q;
+						relation.angular_velocity = av;
+						relation.relation_flags =
+						    relation.relation_flags | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+					}
 				} else {
 					m_relation_history_get(controller->constellation_relation_history, at_timestamp_ns,
 					                       &relation);
