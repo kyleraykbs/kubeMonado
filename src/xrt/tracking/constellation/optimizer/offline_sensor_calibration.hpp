@@ -222,10 +222,13 @@ public: // Methods
 	 *
 	 * @param out_result Written only when this returns true.
 	 * @param device_id  The device to solve. Pass XRT_CONSTELLATION_INVALID_DEVICE_ID to use the best device.
+	 * @param allow_while_collecting When true, the solve may run while samples are still being collected. Used
+	 *        by the per-device controller IMU phase, which keeps collecting while it solves each device.
 	 */
 	bool
 	optimize(CalibrationResult &out_result,
-	         t_constellation_device_id_t device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID);
+	         t_constellation_device_id_t device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID,
+	         bool allow_while_collecting = false);
 
 	/*!
 	 * Copies the solved camera poses from @p result back into the calibration job and marks them concrete, so a

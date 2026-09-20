@@ -1327,7 +1327,9 @@ OfflineSensorCalibration::pushImuSample(t_constellation_device_id_t device_id, c
 }
 
 bool
-OfflineSensorCalibration::optimize(CalibrationResult &out_result, t_constellation_device_id_t requested_device)
+OfflineSensorCalibration::optimize(CalibrationResult &out_result,
+                                   t_constellation_device_id_t requested_device,
+                                   bool allow_while_collecting)
 {
 	/*
 	 * Everything the solve reads is taken out of the object here and the lock is dropped before any of the work
@@ -1348,7 +1350,7 @@ OfflineSensorCalibration::optimize(CalibrationResult &out_result, t_constellatio
 			return false;
 		}
 
-		if (this->collecting_data) {
+		if (this->collecting_data && !allow_while_collecting) {
 			RS_ERROR(this, "Cannot optimize while collecting data.");
 			return false;
 		}

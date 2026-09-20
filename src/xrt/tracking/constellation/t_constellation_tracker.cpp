@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <limits>
 #include <string>
+#include <cmath>
 #include <cstring>
 
 
@@ -85,6 +86,18 @@ num_blobs_for_device(CameraSample &sample, t_constellation_device_id_t device_id
  * @note The prediction is stored on the sample, so this is usable from the slow thread as well, where the fast thread's
  *       predictions are no longer being recomputed.
  */
+/*!
+ * Returns true if @p q is a usable, normalised quaternion. The offline solver leaves the IMU mounting
+ * orientation unset when it isn't observable (e.g. the HMD sitting still during a camera solve), which shows up
+ * as a non-finite or wildly non-unit quaternion. Saving that would clobber the headset's factory calibration.
+ */
+static bool
+is_valid_imu_quat(const xrt_quat &q)
+{
+	const float len_sqrd = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+	return std::isfinite(len_sqrd) && std::fabs(len_sqrd - 1.0f) < 0.05f;
+}
+
 static float
 device_state_camera_distance_sqrd(const DeviceState *device_state)
 {
@@ -158,6 +171,19 @@ run_room_calibration_func(void *ptr)
 	    .accel_scale = result.imu.accel_scale,
 	    .Qcv_imu_model = result.imu.Qcv_imu_model,
 	};
+	if (!is_valid_imu_quat(calibration.Qcv_imu_model)) {
+		auto existing = tracker->pending_imu_calibrations.find(result.device_id);
+		if (existing != tracker->pending_imu_calibrations.end() &&
+		    is_valid_imu_quat(existing->second.Qcv_imu_model)) {
+			calibration.Qcv_imu_model = existing->second.Qcv_imu_model;
+		} else {
+			calibration.Qcv_imu_model = {0.0f, 0.0f, 0.0f, 1.0f};
+		}
+		CT_WARN(tracker,
+		        "Camera solve produced an invalid IMU mounting orientation for device %d, keeping the "
+		        "previous one",
+		        result.device_id);
+	}
 	tracker->sensor_fusion->setDeviceImuCalibration(result.device_id, calibration);
 	tracker->pending_imu_calibrations[result.device_id] = calibration;
 
@@ -1581,7 +1607,6 @@ ConstellationTracker::tryCalibrateDeviceImus()
 	const size_t min_samples = 300;
 	size_t non_camera_count = 0;
 	size_t unsolved = 0;
-	bool solved_any = false;
 
 	for (t_constellation_device_id_t id : ids) {
 		if (id == this->camera_calibration_device_id) {
@@ -1606,7 +1631,7 @@ ConstellationTracker::tryCalibrateDeviceImus()
 		this->device_imu_last_attempt[id] = n;
 
 		offline_sensor_calibration::CalibrationResult result;
-		if (!calib->optimize(result, id)) {
+		if (!calib->optimize(result, id, true)) {
 			CT_WARN(this, "IMU calibration for device %d failed, retrying with more samples", id);
 			continue;
 		}
@@ -1617,11 +1642,14 @@ ConstellationTracker::tryCalibrateDeviceImus()
 		    .accel_scale = result.imu.accel_scale,
 		    .Qcv_imu_model = result.imu.Qcv_imu_model,
 		};
+		if (!is_valid_imu_quat(calibration.Qcv_imu_model)) {
+			CT_WARN(this, "IMU calibration for device %d produced an invalid mounting orientation", id);
+			continue;
+		}
 		this->sensor_fusion->setDeviceImuCalibration(id, calibration);
 		this->pending_imu_calibrations[id] = calibration;
 		this->device_imus_solved.insert(id);
 		unsolved--;
-		solved_any = true;
 
 		CT_INFO(this, "Solved IMU calibration for device %d", id);
 		this->saveRoomSetupCurrent();
@@ -1632,9 +1660,8 @@ ConstellationTracker::tryCalibrateDeviceImus()
 	if ((non_camera_count > 0 && unsolved == 0) || now - this->device_imu_phase_start_ns > phase_timeout) {
 		calib->endCollectingData();
 		this->calibrating_device_imus = false;
-		CT_INFO(this,
-		        "Device IMU calibration phase complete%s (non_camera=%zu unsolved=%zu elapsed=%.1fs)",
-		        solved_any ? "" : " (no controllers seen)", non_camera_count, unsolved,
+		CT_INFO(this, "Device IMU calibration phase complete%s (non_camera=%zu unsolved=%zu elapsed=%.1fs)",
+		        non_camera_count == 0 ? " (no controllers connected)" : "", non_camera_count, unsolved,
 		        (double)(now - this->device_imu_phase_start_ns) / 1e9);
 	}
 }
