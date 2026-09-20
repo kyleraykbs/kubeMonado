@@ -119,7 +119,7 @@ class CalibrationWindow(Gtk.ApplicationWindow):
         self.expected_spin.set_value(100)
         self.expected_spin.connect(
             "value-changed",
-            lambda s: self.send(f"SET expected {int(s.get_value())}"),
+            lambda s: self.send_setting("expected", int(s.get_value())),
         )
         settings.attach(self.expected_spin, 1, 0, 1, 1)
 
@@ -140,7 +140,7 @@ class CalibrationWindow(Gtk.ApplicationWindow):
         self.min_seconds_spin.set_value(5)
         self.min_seconds_spin.connect(
             "value-changed",
-            lambda s: self.send(f"SET min_seconds {int(s.get_value())}"),
+            lambda s: self.send_setting("min_seconds", int(s.get_value())),
         )
         settings.attach(self.min_seconds_spin, 1, 3, 1, 1)
 
@@ -150,7 +150,7 @@ class CalibrationWindow(Gtk.ApplicationWindow):
         self.filter_spin.set_digits(2)
         self.filter_spin.connect(
             "value-changed",
-            lambda s: self.send(f"SET filter {s.get_value():.2f}"),
+            lambda s: self.send_setting("filter", f"{s.get_value():.2f}"),
         )
         settings.attach(self.filter_spin, 1, 4, 1, 1)
 
@@ -219,7 +219,7 @@ class CalibrationWindow(Gtk.ApplicationWindow):
     # --------------------------------------------------------------- signals
 
     def on_refine_changed(self, _switch, state):
-        self.send(f"SET refine {1 if state else 0}")
+        self.send_setting("refine", 1 if state else 0)
         return False
 
     def on_mode_changed(self, dropdown, _param):
@@ -263,7 +263,9 @@ class CalibrationWindow(Gtk.ApplicationWindow):
         except GLib.Error:
             line = None
 
-        if line is None:
+        # EOF shows up as None *or* an empty byte string; treating only None as disconnect made the
+        # read_line -> on_line -> read_line loop spin at 100% CPU forever after the server went away.
+        if not line:
             self.connection = None
             self.status_label.set_text(f"Disconnected, waiting for monado at {SOCKET_PATH}")
             GLib.timeout_add_seconds(1, self.retry_connect)
@@ -279,6 +281,12 @@ class CalibrationWindow(Gtk.ApplicationWindow):
             self.output.write_all((command + "\n").encode())
         except GLib.Error:
             self.connection = None
+
+    def send_setting(self, key, value):
+        # Don't echo commands we sent ourselves while syncing widgets from server state.
+        if self.updating:
+            return
+        self.send(f"SET {key} {value}")
 
     # --------------------------------------------------------------- parsing
 
