@@ -586,9 +586,13 @@ Camera::tryDeviceBlobRecovery(Device *device,
 	 *       Since a RANSAC has already made an assessment over the validity of the pose, and we already trust that
 	 *       assessment, this shouldn't cause many problems.
 	 */
-	// Require the solve to look like a real match rather than trusting RANSAC unconditionally; a degenerate
-	// solve here is what produced the wild controller poses that then drifted forever.
-	constexpr bool kAlwaysTrustRansac = false;
+	/*
+	 * Keep trusting RANSAC here: a valid solve without a prior (the camera-calibration phase, or a device just
+	 * re-acquiring) frequently does not set POSE_MATCH_GOOD, and gating on it made calibration collect nothing.
+	 * Degenerate solves are now rejected by the physical pose_is_plausible gate in pushPose instead, which is
+	 * the check that actually matters.
+	 */
+	constexpr bool kAlwaysTrustRansac = true;
 
 	if (kAlwaysTrustRansac || POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
 		CT_DEBUG(tracker, "Camera %p RANSAC-PnP recovered pose was good enough for device %d from %u blobs",
