@@ -10,6 +10,7 @@
 #include "xrt/xrt_byte_order.h"
 
 #include "math/m_relation_history.h"
+#include "math/m_space.h"
 
 #include "util/u_device.h"
 #include "util/u_var.h"
@@ -108,7 +109,19 @@ rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
 			}
 		}
 
-		(*out_relation) = relation;
+		/*
+		 * The Oculus Touch model/IMU frame is pitched ~40 degrees away from the grip/aim frame. Apply
+		 * the same correction the rift_s driver does. Without it the tracker's raw device pose (what the
+		 * top-down view shows) looks right, but the grip/aim pose handed to the app is ~40 degrees off,
+		 * which only shows up in game.
+		 */
+		struct xrt_relation_chain xrc = {0};
+		struct xrt_pose pose_correction = XRT_POSE_IDENTITY;
+		struct xrt_vec3 axis = {1.0f, 0.0f, 0.0f};
+		math_quat_from_angle_vector(DEG_TO_RAD(40), &axis, &pose_correction.orientation);
+		m_relation_chain_push_pose(&xrc, &pose_correction);
+		*(m_relation_chain_reserve(&xrc)) = relation;
+		m_relation_chain_resolve(&xrc, out_relation);
 		break;
 	}
 	default: return XRT_ERROR_INPUT_UNSUPPORTED;
