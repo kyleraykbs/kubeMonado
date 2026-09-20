@@ -331,9 +331,26 @@ touch_controller_constellation_tracking_source_get_tracked_pose(
 	*out_relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
 
 	/*
-	 * Expire the raw per-camera history as a prior: once it is stale it actively biases the tracker's
-	 * search toward the wrong place and prevents re-acquisition. Returning no prior lets the tracker run
-	 * without CS_FLAG_HAVE_POSE_PRIOR instead.
+	 * Prefer the controller's own estimator as the tracker prior. It is built from the per-camera solves
+	 * plus a vision-derived velocity, so unlike the raw history it stays smooth and never goes stale after
+	 * a missed frame -- which is exactly what stops the controller from losing and re-acquiring constantly
+	 * (the HMD has the same advantage via its IMU fusion prior).
+	 */
+	const timepoint_ns kEstimatorFreshNs = 200 * U_TIME_1MS_IN_NS;
+	bool estimator_fresh = false;
+	{
+		os_mutex_lock(&controller->input.mutex);
+		estimator_fresh = controller->pose_filter.has && when_ns >= controller->pose_filter.ts_ns &&
+		                  (when_ns - controller->pose_filter.ts_ns) < kEstimatorFreshNs;
+		os_mutex_unlock(&controller->input.mutex);
+	}
+	if (estimator_fresh && touch_controller_pose_filter_get(controller, when_ns, out_relation)) {
+		return;
+	}
+
+	/*
+	 * Fallback: the raw per-camera history, expired once stale so it can't bias the search toward the
+	 * wrong place; returning no prior lets the tracker run without CS_FLAG_HAVE_POSE_PRIOR instead.
 	 */
 	const timepoint_ns kPriorExpiryNs = 300 * U_TIME_1MS_IN_NS;
 	int64_t latest_ns = 0;
