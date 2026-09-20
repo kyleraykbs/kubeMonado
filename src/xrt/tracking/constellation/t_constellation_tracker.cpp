@@ -678,10 +678,15 @@ Camera::assignBlobsGlobally(CameraSample &sample)
 	}
 
 	/*
-	 * The LED nearest to the camera wins a contested blob, because it is the one that is actually visible and is
-	 * occluding the others. A blob and an LED can each only be used once.
+	 * Resolve contested blobs by how well they fit each device's *predicted* pose (which is the
+	 * IMU-fused previous pose), not by raw depth. A blob fits the controller that expects it there, so
+	 * this keeps each controller near where it already was and stops the two from trading blobs.
+	 * Depth only breaks near-ties, where the nearer LED is the one actually visible.
 	 */
 	std::sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b) {
+		if (std::abs(a.sq_error - b.sq_error) > 2.0) {
+			return a.sq_error < b.sq_error;
+		}
 		return a.depth_m < b.depth_m;
 	});
 
