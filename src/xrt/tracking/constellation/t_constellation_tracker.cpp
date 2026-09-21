@@ -2065,12 +2065,18 @@ ConstellationTracker::getTrackedPose(t_constellation_device_id_t device_id,
 		// to the fusion if the bridge has gone stale so a dead process can't freeze tracking).
 		if (this->ml_override_enabled.load()) {
 			std::unique_lock<os::Mutex> dlk(device->data_lock);
-			if (device->locked_data.ml_has && when_ns >= device->locked_data.ml_ts &&
-			    (when_ns - device->locked_data.ml_ts) < (timepoint_ns)(100 * U_TIME_1MS_IN_NS)) {
-				out_relation = device->locked_data.ml_relation;
-				out_relation.relation_flags = static_cast<xrt_space_relation_flags>(
+			const auto &ld = device->locked_data;
+			if (ld.ml_has && when_ns >= ld.ml_ts &&
+			    (when_ns - ld.ml_ts) < (timepoint_ns)(150 * U_TIME_1MS_IN_NS)) {
+				xrt_space_relation ml = ld.ml_relation;
+				ml.relation_flags = static_cast<xrt_space_relation_flags>(
 				    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
-				    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
+				    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+				    XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT |
+				    XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+				// The model runs at ~20Hz; extrapolate to the requested time with the velocities the
+				// bridge derived, otherwise the pose is a zero-order hold and lags in motion.
+				m_predict_relation(&ml, time_ns_to_s(when_ns - ld.ml_ts), &out_relation);
 				return;
 			}
 		}
