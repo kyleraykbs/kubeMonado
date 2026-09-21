@@ -2066,17 +2066,22 @@ ConstellationTracker::getTrackedPose(t_constellation_device_id_t device_id,
 		if (this->ml_override_enabled.load()) {
 			std::unique_lock<os::Mutex> dlk(device->data_lock);
 			const auto &ld = device->locked_data;
-			if (ld.ml_has && when_ns >= ld.ml_ts &&
-			    (when_ns - ld.ml_ts) < (timepoint_ns)(150 * U_TIME_1MS_IN_NS)) {
+			timepoint_ns age = when_ns > ld.ml_ts ? when_ns - ld.ml_ts : 0;
+			if (ld.ml_has && when_ns >= ld.ml_ts && age < (timepoint_ns)(250 * U_TIME_1MS_IN_NS)) {
 				xrt_space_relation ml = ld.ml_relation;
 				ml.relation_flags = static_cast<xrt_space_relation_flags>(
 				    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
 				    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
 				    XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT |
 				    XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
-				// The model runs at ~20Hz; extrapolate to the requested time with the velocities the
-				// bridge derived, otherwise the pose is a zero-order hold and lags in motion.
-				m_predict_relation(&ml, time_ns_to_s(when_ns - ld.ml_ts), &out_relation);
+				// Extrapolate to the requested time, but only as far as the model's confidence allows:
+				// low confidence decays toward a zero-order hold (last pose) instead of a hard 150ms cliff.
+				double dt_s = (double)age * 1e-9;
+				double horizon = 0.150 * (double)ld.ml_conf;
+				if (dt_s > horizon) {
+					dt_s = horizon;
+				}
+				m_predict_relation(&ml, dt_s, &out_relation);
 				return;
 			}
 		}

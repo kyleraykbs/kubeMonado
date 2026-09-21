@@ -285,11 +285,14 @@ static void handleCommand(CalibrationServer *server, const char *line) {
 	} else if (strncmp(line, "MLPOSE ", 7) == 0) {
 		int id = -1;
 		xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
-		if (sscanf(line + 7, "%d %f %f %f %f %f %f %f %f %f %f %f %f %f", &id, &rel.pose.position.x,
-		           &rel.pose.position.y, &rel.pose.position.z, &rel.pose.orientation.x,
-		           &rel.pose.orientation.y, &rel.pose.orientation.z, &rel.pose.orientation.w,
-		           &rel.linear_velocity.x, &rel.linear_velocity.y, &rel.linear_velocity.z,
-		           &rel.angular_velocity.x, &rel.angular_velocity.y, &rel.angular_velocity.z) >= 8) {
+		float conf = 1.0f;
+		int n = sscanf(line + 7, "%d %f %f %f %f %f %f %f %f %f %f %f %f %f %f", &id,
+		               &rel.pose.position.x, &rel.pose.position.y, &rel.pose.position.z,
+		               &rel.pose.orientation.x, &rel.pose.orientation.y, &rel.pose.orientation.z,
+		               &rel.pose.orientation.w, &rel.linear_velocity.x, &rel.linear_velocity.y,
+		               &rel.linear_velocity.z, &rel.angular_velocity.x, &rel.angular_velocity.y,
+		               &rel.angular_velocity.z, &conf);
+		if (n >= 8) {
 			std::shared_lock dlk(tracker->device_lock);
 			for (auto &device : tracker->devices) {
 				if (device->id == (t_constellation_device_id_t)id) {
@@ -297,6 +300,9 @@ static void handleCommand(CalibrationServer *server, const char *line) {
 					device->locked_data.ml_relation = rel;
 					device->locked_data.ml_has = true;
 					device->locked_data.ml_ts = os_monotonic_get_ns();
+					if (n >= 15) {
+						device->locked_data.ml_conf = conf < 0.0f ? 0.0f : (conf > 1.0f ? 1.0f : conf);
+					}
 					break;
 				}
 			}

@@ -415,6 +415,8 @@ public: // Fields
 		bool ml_has{false};
 		int64_t ml_ts{0};
 		xrt_space_relation ml_relation{};
+		//! Model-reported confidence in [0,1]; gates how far extrapolation may trust the velocity.
+		float ml_conf{1.0f};
 	} locked_data;
 	// clang-format on
 
