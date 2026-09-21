@@ -213,10 +213,18 @@ static std::string buildMlBlock(ConstellationTracker *tracker) {
 				t_constellation_tracker_tracking_source_get_tracked_pose(device->params.tracking_source, now, &pred);
 			}
 			bool valid = (pred.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0;
-			snprintf(line, sizeof(line), "DEV %d %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n", device->id,
-			         valid ? 1 : 0, pred.pose.position.x, pred.pose.position.y, pred.pose.position.z,
-			         pred.pose.orientation.x, pred.pose.orientation.y, pred.pose.orientation.z,
-			         pred.pose.orientation.w);
+			// Angular velocity from the sensor fusion (IMU-integrated) as the model's gyro input.
+			xrt_space_relation fused = XRT_SPACE_RELATION_ZERO;
+			timepoint_ns fused_ts = 0;
+			tracker->sensor_fusion->getTrackedPose(device->id, now, fused_ts, fused);
+			xrt_vec3 av = {0.0f, 0.0f, 0.0f};
+			if ((fused.relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) != 0) {
+				av = fused.angular_velocity;
+			}
+			snprintf(line, sizeof(line),
+			         "DEV %d %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n", device->id, valid ? 1 : 0,
+			         pred.pose.position.x, pred.pose.position.y, pred.pose.position.z, pred.pose.orientation.x,
+			         pred.pose.orientation.y, pred.pose.orientation.z, pred.pose.orientation.w, av.x, av.y, av.z);
 			out += line;
 		}
 	}
