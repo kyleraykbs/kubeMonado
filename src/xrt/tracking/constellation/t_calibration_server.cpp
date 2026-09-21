@@ -380,9 +380,16 @@ static void serverThreadFunc(CalibrationServer *server) {
 			}
 		}
 		if (server->tracker->ml_override_enabled.load()) {
-			std::string block = buildMlBlock(server->tracker);
-			for (auto &c : server->clients) {
-				if (c.fd >= 0) send(c.fd, block.c_str(), block.size(), SEND_FLAGS);
+			// The consumer runs the model once per frame (~tens of ms), so throttle the block to ~30 Hz
+			// instead of rebuilding and sending the full observation set every few ms.
+			static auto last_ml = std::chrono::steady_clock::now();
+			auto now = std::chrono::steady_clock::now();
+			if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ml).count() >= 33) {
+				last_ml = now;
+				std::string block = buildMlBlock(server->tracker);
+				for (auto &c : server->clients) {
+					if (c.fd >= 0) send(c.fd, block.c_str(), block.size(), SEND_FLAGS);
+				}
 			}
 		}
 	}
