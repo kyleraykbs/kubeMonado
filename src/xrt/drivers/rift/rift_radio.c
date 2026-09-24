@@ -296,6 +296,21 @@ touch_controller_pose_filter_get(struct rift_touch_controller *controller,
 		touch_controller_pose_filter_flush(controller);
 	}
 
+	/*
+	 * Angular velocity for the orientation extrapolation comes from the IMU gyro, not the difference of
+	 * consecutive vision orientations. The vision-derived estimate lags by a frame and was clamped hard, so
+	 * during fast swings it under-rotates and the controller trails the hand. The IMU is calibrated and its
+	 * angular velocity is reported in the same (tracking) frame, so use it when available.
+	 */
+	struct xrt_vec3 av_pred = XRT_VEC3_ZERO;
+	{
+		struct xrt_quat imu_q = XRT_QUAT_IDENTITY;
+		struct xrt_vec3 imu_av = XRT_VEC3_ZERO;
+		if (imu_fusion_get_prediction(controller->input.imu_fusion, (uint64_t)when, &imu_q, &imu_av) == 0) {
+			av_pred = imu_av;
+		}
+	}
+
 	os_mutex_lock(&controller->input.mutex);
 	if (!controller->pose_filter.has) {
 		os_mutex_unlock(&controller->input.mutex);
@@ -319,15 +334,21 @@ touch_controller_pose_filter_get(struct rift_touch_controller *controller,
 	struct xrt_vec3 pos =
 	    m_vec3_add(controller->pose_filter.pos, m_vec3_mul_scalar(controller->pose_filter.vel, (float)dt_pos));
 	struct xrt_quat ori = controller->pose_filter.ori;
-	float wmag = m_vec3_len(controller->pose_filter.ang_vel);
+	// Prefer the gyro; fall back to the vision-derived estimate if the IMU had nothing.
+	struct xrt_vec3 av = (m_vec3_len(av_pred) > 1e-3f) ? av_pred : controller->pose_filter.ang_vel;
+	float wmag = m_vec3_len(av);
 	if (wmag > 1e-3f) {
-		struct xrt_vec3 axis = m_vec3_mul_scalar(controller->pose_filter.ang_vel, 1.0f / wmag);
+		struct xrt_vec3 axis = m_vec3_mul_scalar(av, 1.0f / wmag);
+		// The gyro stays trustworthy well past the rate the vision-derived estimate was clamped to.
+		if (wmag > 20.0f) {
+			wmag = 20.0f;
+		}
 		struct xrt_quat dq;
 		math_quat_from_angle_vector(wmag * (float)dt, &axis, &dq);
 		ori = touch_quat_mul(dq, ori);
 	}
 	struct xrt_vec3 vel = controller->pose_filter.vel;
-	struct xrt_vec3 ang_vel = controller->pose_filter.ang_vel;
+	struct xrt_vec3 ang_vel = av;
 	os_mutex_unlock(&controller->input.mutex);
 
 	out_relation->pose.position = pos;
